@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright 2026 SOPROMER
+     License LGPL-3.0 or later (https://www.gnu.org/licenses/lgpl). -->
+<odoo>
+
+    <record id="view_pos_config_form_auto_close" model="ir.ui.view">
+        <field name="name">pos.config.form.auto.close</field>
+        <field name="model">pos.config</field>
+        <field name="inherit_id" ref="point_of_sale.pos_config_view_form"/>
+        <field name="arch" type="xml">
+
+            <!-- Append a dedicated section at the end of the inside-form layout. -->
+            <xpath expr="//form/sheet" position="inside">
+                <group string="Fermeture automatique" name="auto_close_group">
+                    <field name="auto_close_enabled"/>
+                    <field name="auto_close_hour_override"
+                           invisible="not auto_close_enabled"/>
+                </group>
+            </xpath>
+
+        </field>
+    </record>
+
+</odoo>
