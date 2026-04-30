@@ -194,26 +194,62 @@ class PosSession(models.Model):
             self.name, self.config_id.name, now_str,
         )
 
-        # 1. Move to closing_control (Odoo computes cash_register_balance_end
-        #    = balance_start + total_entry from cash moves & payments).
+        # 1. Pre-fill balance_end_real = balance_end (expected cash).
+        # cash_register_balance_end est un computed natif :
+        #   balance_start + sum(stmt_lines.amount) + total_cash_payment
+        # En settant balance_end_real = balance_end AVANT closing_control,
+        # cash_register_difference reste 0 → pas de perte/gain comptable.
+        # Sans ça, le solde de fond reste "perdu" car balance_end_real=0.
+        expected_cash = self.cash_register_balance_end
+        self.write({
+            'cash_register_balance_end_real': expected_cash,
+        })
+        # Flush + invalider cache pour que action_pos_session_closing_control
+        # voit la nouvelle valeur lors de son compute interne.
+        self.flush_recordset(['cash_register_balance_end_real'])
+        self.invalidate_recordset(['cash_register_balance_end', 'cash_register_difference'])
+
+        # 2. Move to closing_control (Odoo 18 peut finaliser direct vers
+        # 'closed' si balance_end_real déjà set et pas de diff).
         if self.state == 'opened':
             self.action_pos_session_closing_control()
+
+        # 3. Cleanup phantom "Écart d'espèces" stmt_line si égale à -balance_start
+        # (artefact Odoo 18 sur sessions sans transactions où la diff
+        # apparaît malgré balance_end_real correct). Détection stricte :
+        # amount opposé exact à balance_start ET label contient 'Écart'.
+        self = self.exists()
+        if self:
+            phantom_ecart = self.sudo().statement_line_ids.filtered(
+                lambda sl: (
+                    sl.payment_ref
+                    and ('Écart' in sl.payment_ref or 'Cash difference' in sl.payment_ref)
+                    and abs(sl.amount + balance_start) < 0.01
+                )
+            )
+            if phantom_ecart:
+                _logger.warning(
+                    "[pos_auto_close] Session %s: phantom écart stmt_line "
+                    "%s (%s) detected, unlinking.",
+                    self.name, phantom_ecart.ids, phantom_ecart.mapped('amount'),
+                )
+                phantom_ecart.sudo().unlink()
 
         # Refresh after state change.
         self = self.exists()
         if not self:
             return
 
-        expected_cash = self.cash_register_balance_end
+        close_result = None
 
-        # 2. Auto-fill balance_end_real with the expected balance, since
-        #    cashiers won't physically count cash at this hour.
-        self.write({
-            'cash_register_balance_end_real': expected_cash,
-        })
-
-        # 3. Finalize closing.
-        close_result = self.action_pos_session_close()
+        if self.state == 'closed':
+            _logger.info(
+                "[pos_auto_close] Session %s closed by closing_control directly.",
+                self.name,
+            )
+        else:
+            # 3. Si encore en closing_control, finaliser le close.
+            close_result = self.action_pos_session_close()
 
         # 4. Detailed audit message in chatter.
         cash_moves_lines = []
@@ -315,9 +351,16 @@ class PosSession(models.Model):
             )
             return
 
+        # Email from = SMTP user du serveur sortant actif (sinon fallback
+        # company.email). Évite l'écart from_filter si company.email pointe
+        # un domaine non autorisé par le serveur SMTP.
+        mail_server = self.env['ir.mail_server'].sudo().search(
+            [], order='sequence, id', limit=1,
+        )
         company = self.company_id or self.env.company
         email_from = (
-            company.email
+            (mail_server.smtp_user if mail_server else None)
+            or company.email
             or self.env.user.email
             or 'noreply@sopromer.mg'
         )

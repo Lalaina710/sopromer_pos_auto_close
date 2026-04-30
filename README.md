@@ -231,6 +231,36 @@ pas de modele custom, pas d'asset frontend.
 
 ## Historique des versions
 
+### 18.0.1.1.4 - 2026-04-30
+
+- Cleanup phantom `Écart d'espèces` stmt_line créée par Odoo natif sur
+  sessions sans transactions (artefact). Detection : montant = -balance_start
+  + label contient `Écart` ou `Cash difference`
+- `flush_recordset` + `invalidate_recordset` après set balance_end_real
+  pour forcer Odoo à voir la nouvelle valeur lors de closing_control compute
+- Body chatter et email reflètent maintenant correctement "aucun mouvement"
+  pour sessions sans transactions
+
+### 18.0.1.1.3 - 2026-04-30
+
+- Pre-fill `cash_register_balance_end_real = cash_register_balance_end`
+  AVANT `action_pos_session_closing_control()` (au lieu d'après)
+- Garantit `cash_register_difference = 0` → pas de perte/gain comptable
+- Skip `action_pos_session_close()` si state déjà `closed` (Odoo 18 finalise
+  parfois direct via closing_control)
+
+### 18.0.1.1.2 - 2026-04-30
+
+- `email_from` cascade : `ir.mail_server.smtp_user` (1er actif) prioritaire
+  sur `company.email`. Évite mismatch from_filter SMTP
+
+### 18.0.1.1.1 - 2026-04-30
+
+- Fix HOUR_SELECTION clés string `'00'..'23'` (Odoo 18 ValidationError sur
+  Selection avec clés int)
+- Suppression champ `numbercall` dans ir_cron.xml (retiré Odoo 18)
+- Skip `action_pos_session_close()` si state == 'closed' après closing_control
+
 ### 18.0.1.1.0 - 2026-04-30
 
 - Notification email apres chaque fermeture automatique reussie

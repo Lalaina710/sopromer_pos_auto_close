@@ -3,7 +3,7 @@
 # License LGPL-3.0 or later (https://www.gnu.org/licenses/lgpl).
 {
     'name': 'SOPROMER POS Auto Close',
-    'version': '18.0.1.1.0',
+    'version': '18.0.1.1.4',
     'category': 'Point of Sale',
     'summary': 'Fermeture automatique sessions POS avec calcul auto balance + notification email',
     'description': """
