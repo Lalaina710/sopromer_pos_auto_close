@@ -41,17 +41,21 @@ class PosSession(models.Model):
             )
             return
 
-        try:
-            global_hour = int(
-                IrConfig.get_param(
-                    'sopromer_pos_auto_close.hour_global', default=19
+        # Lecture heure globale. Si vide/non-définie → None (skip global).
+        # Permet d'installer le module sans déclencher de fermeture tant que
+        # l'admin n'a pas défini d'heure (ni global, ni override par PdV).
+        raw_hour = IrConfig.get_param('sopromer_pos_auto_close.hour_global', default='')
+        if raw_hour in (False, None, ''):
+            global_hour = None
+        else:
+            try:
+                global_hour = int(raw_hour)
+            except (TypeError, ValueError):
+                global_hour = None
+                _logger.warning(
+                    "[pos_auto_close] Invalid hour_global '%s', treated as empty.",
+                    raw_hour,
                 )
-            )
-        except (TypeError, ValueError):
-            global_hour = 19
-            _logger.warning(
-                "[pos_auto_close] Invalid hour_global, fallback to 19h."
-            )
 
         opened_sessions = self.search([('state', '=', 'opened')])
         if not opened_sessions:
@@ -59,8 +63,9 @@ class PosSession(models.Model):
             return
 
         _logger.info(
-            "[pos_auto_close] Scanning %d opened session(s), global_hour=%dh",
-            len(opened_sessions), global_hour,
+            "[pos_auto_close] Scanning %d opened session(s), global_hour=%s",
+            len(opened_sessions),
+            "%dh" % global_hour if global_hour is not None else "(empty)",
         )
 
         for session in opened_sessions:
@@ -103,11 +108,19 @@ class PosSession(models.Model):
             )
             return
 
-        target_hour = (
-            config.auto_close_hour_override
-            if config.auto_close_hour_override not in (False, None)
-            else global_hour
-        )
+        # Priorité override PdV > heure globale.
+        # Si les deux sont vides → skip silencieux (pas de fermeture configurée).
+        override = config.auto_close_hour_override
+        if override not in (False, None, ''):
+            target_hour = override
+        elif global_hour is not None:
+            target_hour = global_hour
+        else:
+            _logger.info(
+                "[pos_auto_close] Session %s: no hour configured (override + global empty), skip.",
+                session.name,
+            )
+            return
 
         company_tz = session.company_id.partner_id.tz or 'Indian/Antananarivo'
         try:

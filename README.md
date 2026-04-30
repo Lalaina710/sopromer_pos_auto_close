@@ -231,6 +231,14 @@ pas de modele custom, pas d'asset frontend.
 
 ## Historique des versions
 
+### 18.0.1.1.5 - 2026-04-30
+
+- Heure globale vide (ICP non défini ou '') → cron **skip silencieusement**
+  au lieu de fallback 19h
+- Permet d'installer le module sans déclencher de fermeture tant qu'aucune
+  heure n'est configurée (global ou override PdV)
+- Skip explicite par session si override vide ET global vide
+
 ### 18.0.1.1.4 - 2026-04-30
 
 - Cleanup phantom `Écart d'espèces` stmt_line créée par Odoo natif sur
