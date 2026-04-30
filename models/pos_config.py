@@ -4,7 +4,7 @@
 from odoo import fields, models
 
 
-HOUR_SELECTION = [(h, "%02d:00" % h) for h in range(24)]
+HOUR_SELECTION = [("%02d" % h, "%02d:00" % h) for h in range(24)]
 
 
 class PosConfig(models.Model):
@@ -26,5 +26,15 @@ class PosConfig(models.Model):
             "Si defini, surcharge l'heure de fermeture globale pour ce PdV. "
             "Laisser vide pour utiliser l'heure globale configuree dans les "
             "parametres Point de Vente."
+        ),
+    )
+    auto_close_email_to_override = fields.Char(
+        string="Destinataire(s) email (override)",
+        help=(
+            "Si defini, surcharge le destinataire global de la notification "
+            "email envoyee apres fermeture automatique pour ce PdV. Plusieurs "
+            "adresses peuvent etre separees par virgule (,) ou point-virgule "
+            "(;). Laisser vide pour utiliser le destinataire global configure "
+            "dans les parametres Point de Vente."
         ),
     )

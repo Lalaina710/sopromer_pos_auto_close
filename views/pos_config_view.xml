@@ -15,6 +15,9 @@
                     <field name="auto_close_enabled"/>
                     <field name="auto_close_hour_override"
                            invisible="not auto_close_enabled"/>
+                    <field name="auto_close_email_to_override"
+                           placeholder="responsable.pdv@sopromer.mg"
+                           invisible="not auto_close_enabled"/>
                 </group>
             </xpath>
 

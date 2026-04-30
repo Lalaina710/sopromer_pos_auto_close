@@ -25,9 +25,9 @@ physique n'est requis : tous les flux cash sont deja traces dans Odoo
 
 | Modele | Champs ajoutes / methodes |
 |--------|--------------------------|
-| `res.config.settings` | `pos_auto_close_enabled`, `pos_auto_close_hour_global` (ICP) |
-| `pos.config` | `auto_close_enabled`, `auto_close_hour_override` |
-| `pos.session` | `_cron_auto_close_sessions()`, `_auto_close_dispatch()`, `_auto_close_session()` |
+| `res.config.settings` | `pos_auto_close_enabled`, `pos_auto_close_hour_global`, `pos_auto_close_email_to` (ICP) |
+| `pos.config` | `auto_close_enabled`, `auto_close_hour_override`, `auto_close_email_to_override` |
+| `pos.session` | `_cron_auto_close_sessions()`, `_auto_close_dispatch()`, `_auto_close_session()`, `_send_auto_close_email()`, `_resolve_auto_close_email_recipients()` |
 
 Aucun nouveau modele : pas de `ir.model.access.csv` necessaire.
 
@@ -64,6 +64,51 @@ _cron_auto_close_sessions()
 Chaque session est traitee dans son propre try/except : une erreur sur une
 session ne bloque pas le reste du batch. Stack trace logguee + postee en
 chatter.
+
+## Notification email
+
+Apres chaque fermeture automatique reussie, un email est envoye au(x)
+destinataire(s) configure(s). Le contenu reprend le message poste dans le
+chatter (solde initial, solde theorique, solde de cloture, mouvements de
+caisse).
+
+### Configuration des destinataires (2 niveaux)
+
+| Niveau | Champ | Stockage | Format |
+|--------|-------|----------|--------|
+| Global | `pos_auto_close_email_to` (Settings -> Point de Vente) | ICP `sopromer_pos_auto_close.email_to` | 1 ou plusieurs emails separes par `,` ou `;` |
+| PdV | `auto_close_email_to_override` (form pos.config) | Champ direct | Idem |
+
+Resolution :
+
+1. Si l'override PdV est rempli -> utilise cette adresse
+2. Sinon -> fallback sur le destinataire global
+3. Si les deux sont vides -> aucun email envoye (skip silencieux)
+
+### Exemples
+
+| PdV | Override PdV | Global | Destinataire effectif |
+|-----|--------------|--------|----------------------|
+| Magasin A | (vide) | `compta@sopromer.mg` | compta@sopromer.mg |
+| Magasin B | `directeur.b@sopromer.mg` | `compta@sopromer.mg` | directeur.b@sopromer.mg |
+| Magasin C | `manager@x; super@y` | -- | manager@x ET super@y |
+| Magasin D | (vide) | (vide) | aucun email envoye |
+
+### Format email
+
+- **Subject** : `[SOPROMER] Session POS auto-fermee - <session.name> (<pos_config.name>)`
+- **Body HTML** : intro + meme contenu que le chatter (balance_start, expected,
+  balance_end_real, liste des mouvements de caisse)
+- **From** : `company.email` ou fallback `noreply@sopromer.mg`
+- **Mode** : `mail.mail` standard avec `auto_delete=True`, envoi async
+
+### Tolerance erreur
+
+Si l'envoi email echoue (DNS, SMTP down, adresse invalide) :
+
+- `_logger.error()` avec stack trace complet
+- La fermeture de session reste **valide** (pas de rollback)
+- Le cron continue avec les autres sessions
 
 ## Configuration (2 niveaux)
 
@@ -185,6 +230,15 @@ pas de modele custom, pas d'asset frontend.
   globalement, activer PdV par PdV.
 
 ## Historique des versions
+
+### 18.0.1.1.0 - 2026-04-30
+
+- Notification email apres chaque fermeture automatique reussie
+- Config 2 niveaux : ICP global `sopromer_pos_auto_close.email_to` +
+  override par PdV `auto_close_email_to_override`
+- Parsing multi-destinataires (separateurs `,` et `;`)
+- Tolerance aux erreurs SMTP (log + skip, pas de rollback)
+- Ajout dependance `mail`
 
 ### 18.0.1.0.0 - 2026-04-30
 

@@ -2,6 +2,7 @@
 # Copyright 2026 SOPROMER
 # License LGPL-3.0 or later (https://www.gnu.org/licenses/lgpl).
 import logging
+import re
 import traceback
 from datetime import datetime
 
@@ -10,6 +11,9 @@ import pytz
 from odoo import _, api, models
 
 _logger = logging.getLogger(__name__)
+
+# Match comma or semicolon separators in email recipient lists.
+_EMAIL_SPLIT_RE = re.compile(r'[;,]')
 
 
 class PosSession(models.Model):
@@ -251,5 +255,99 @@ class PosSession(models.Model):
             self.name, balance_start, expected_cash,
         )
 
+        # 5. Best-effort email notification (never block close on failure).
+        try:
+            self._send_auto_close_email(
+                body_html=body,
+                expected_cash=expected_cash,
+                balance_start=balance_start,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _logger.error(
+                "[pos_auto_close] Session %s: email notification failed: %s\n%s",
+                self.name, exc, traceback.format_exc(),
+            )
+
         # Pass through any wizard/action returned by core close.
         return close_result
+
+    # ---------------------------------------------------------------------
+    # Email notification
+    # ---------------------------------------------------------------------
+    def _resolve_auto_close_email_recipients(self):
+        """Return cleaned email recipient list for `self`.
+
+        Resolution order:
+          1. PdV override (`config.auto_close_email_to_override`)
+          2. Global ICP `sopromer_pos_auto_close.email_to`
+
+        Splits on `,` or `;`, strips whitespace, drops empty entries.
+        """
+        self.ensure_one()
+        override = self.config_id.auto_close_email_to_override or ''
+        if override.strip():
+            raw = override
+        else:
+            raw = self.env['ir.config_parameter'].sudo().get_param(
+                'sopromer_pos_auto_close.email_to', default=''
+            ) or ''
+        if not raw.strip():
+            return []
+        return [
+            addr.strip()
+            for addr in _EMAIL_SPLIT_RE.split(raw)
+            if addr and addr.strip()
+        ]
+
+    def _send_auto_close_email(self, body_html, expected_cash, balance_start):
+        """Send email notification after a successful auto-close.
+
+        Silently skips when no recipient is configured. Caller wraps in
+        try/except so any SMTP/DNS error is swallowed and never blocks the
+        cron loop.
+        """
+        self.ensure_one()
+        recipients = self._resolve_auto_close_email_recipients()
+        if not recipients:
+            _logger.info(
+                "[pos_auto_close] Session %s: no email recipient, skip mail.",
+                self.name,
+            )
+            return
+
+        company = self.company_id or self.env.company
+        email_from = (
+            company.email
+            or self.env.user.email
+            or 'noreply@sopromer.mg'
+        )
+        email_to = ', '.join(recipients)
+
+        subject = _(
+            "[SOPROMER] Session POS auto-fermee - %(session)s (%(pdv)s)",
+            session=self.name,
+            pdv=self.config_id.name,
+        )
+
+        intro = _(
+            "<p>Notification automatique : la session POS "
+            "<b>%(session)s</b> du PdV <b>%(pdv)s</b> a ete fermee "
+            "automatiquement.</p>",
+            session=self.name,
+            pdv=self.config_id.name,
+        )
+        full_body = intro + body_html
+
+        mail_vals = {
+            'subject': subject,
+            'body_html': full_body,
+            'email_from': email_from,
+            'email_to': email_to,
+            'auto_delete': True,
+        }
+        mail = self.env['mail.mail'].sudo().create(mail_vals)
+        mail.send()  # async send via mail.mail standard pipeline
+        _logger.info(
+            "[pos_auto_close] Session %s: email queued to %s (mail.id=%s).",
+            self.name, email_to, mail.id,
+        )

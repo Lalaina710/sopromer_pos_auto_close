@@ -22,6 +22,12 @@
                                        class="col-lg-4 o_light_label"/>
                                 <field name="pos_auto_close_hour_global"/>
                             </div>
+                            <div class="row mt8">
+                                <label for="pos_auto_close_email_to"
+                                       class="col-lg-4 o_light_label"/>
+                                <field name="pos_auto_close_email_to"
+                                       placeholder="responsable@sopromer.mg, compta@sopromer.mg"/>
+                            </div>
                         </div>
                     </setting>
                 </block>
