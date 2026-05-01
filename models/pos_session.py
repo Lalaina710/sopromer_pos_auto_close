@@ -41,21 +41,14 @@ class PosSession(models.Model):
             )
             return
 
-        # Lecture heure globale. Si vide/non-définie → None (skip global).
+        # Lecture heure + minute globales. Si vide/non-définie → None (skip).
         # Permet d'installer le module sans déclencher de fermeture tant que
         # l'admin n'a pas défini d'heure (ni global, ni override par PdV).
-        raw_hour = IrConfig.get_param('sopromer_pos_auto_close.hour_global', default='')
-        if raw_hour in (False, None, ''):
-            global_hour = None
-        else:
-            try:
-                global_hour = int(raw_hour)
-            except (TypeError, ValueError):
-                global_hour = None
-                _logger.warning(
-                    "[pos_auto_close] Invalid hour_global '%s', treated as empty.",
-                    raw_hour,
-                )
+        global_hour = self._read_int_icp(IrConfig, 'sopromer_pos_auto_close.hour_global')
+        global_minute = self._read_int_icp(IrConfig, 'sopromer_pos_auto_close.minute_global')
+        # Default minute = 0 si non défini, pour compat avec installs anciens.
+        if global_minute is None:
+            global_minute = 0
 
         opened_sessions = self.search([('state', '=', 'opened')])
         if not opened_sessions:
@@ -63,14 +56,14 @@ class PosSession(models.Model):
             return
 
         _logger.info(
-            "[pos_auto_close] Scanning %d opened session(s), global_hour=%s",
+            "[pos_auto_close] Scanning %d opened session(s), global=%s",
             len(opened_sessions),
-            "%dh" % global_hour if global_hour is not None else "(empty)",
+            "%02d:%02d" % (global_hour, global_minute) if global_hour is not None else "(empty)",
         )
 
         for session in opened_sessions:
             try:
-                self._auto_close_dispatch(session, global_hour)
+                self._auto_close_dispatch(session, global_hour, global_minute)
             except Exception as exc:  # noqa: BLE001
                 # Defensive: never let one session crash the whole cron.
                 _logger.error(
@@ -91,12 +84,39 @@ class PosSession(models.Model):
                     pass
 
     @api.model
-    def _auto_close_dispatch(self, session, global_hour):
+    def _fmt_money(self, amount):
+        """Format montant avec espace milliers, virgule decimale, 2 chiffres.
+        Ex: 857300 -> '857 300,00', 361767.04000000004 -> '361 767,04'.
+        """
+        try:
+            v = round(float(amount or 0.0), 2)
+        except (TypeError, ValueError):
+            return str(amount)
+        s = "{:,.2f}".format(v)  # ex '857,300.00'
+        # FR : remplace , par espace et . par ,
+        return s.replace(',', ' ').replace('.', ',').replace(' ', ' ')
+
+    @api.model
+    def _read_int_icp(self, IrConfig, key):
+        """Lit ICP `key` et retourne int ou None si vide/invalide."""
+        raw = IrConfig.get_param(key, default='')
+        if raw in (False, None, ''):
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            _logger.warning(
+                "[pos_auto_close] Invalid ICP %s='%s', treated as empty.", key, raw,
+            )
+            return None
+
+    @api.model
+    def _auto_close_dispatch(self, session, global_hour, global_minute=0):
         """Decide whether `session` must be closed now and act accordingly.
 
         Skips silently when:
           - the PdV opted out (auto_close_enabled = False)
-          - the current hour is not the target hour for this PdV
+          - the current time is not within target window (5-min window)
           - the session is in opening_control
           - the session has draft orders pending
         """
@@ -109,18 +129,27 @@ class PosSession(models.Model):
             return
 
         # Priorité override PdV > heure globale.
-        # Si les deux sont vides → skip silencieux (pas de fermeture configurée).
-        override = config.auto_close_hour_override
-        if override not in (False, None, ''):
-            target_hour = override
+        # Si heure globale ET override PdV vides → skip silencieux.
+        override_h = config.auto_close_hour_override
+        if override_h not in (False, None, ''):
+            target_hour = int(override_h)
         elif global_hour is not None:
-            target_hour = global_hour
+            target_hour = int(global_hour)
         else:
             _logger.info(
                 "[pos_auto_close] Session %s: no hour configured (override + global empty), skip.",
                 session.name,
             )
             return
+
+        # Minute : override PdV > globale > 0.
+        override_m = config.auto_close_minute_override
+        if override_m not in (False, None, ''):
+            target_minute = int(override_m)
+        elif global_minute is not None:
+            target_minute = int(global_minute)
+        else:
+            target_minute = 0
 
         company_tz = session.company_id.partner_id.tz or 'Indian/Antananarivo'
         try:
@@ -131,9 +160,13 @@ class PosSession(models.Model):
                 "[pos_auto_close] Unknown tz %s, fallback Indian/Antananarivo.",
                 company_tz,
             )
-        current_hour = datetime.now(tz).hour
+        now_dt = datetime.now(tz)
+        current_total = now_dt.hour * 60 + now_dt.minute
+        target_total = target_hour * 60 + target_minute
 
-        if current_hour != int(target_hour):
+        # Fenêtre 5 min (cron tourne toutes les 5 min). Idempotence garantie
+        # par le check state='opened' (session déjà closed = skip à la prochaine).
+        if not (target_total <= current_total < target_total + 5):
             return
 
         # Edge case 1: opening_control (cashier never validated opening)
@@ -267,12 +300,20 @@ class PosSession(models.Model):
         # 4. Detailed audit message in chatter.
         cash_moves_lines = []
         for cm in self.statement_line_ids:
-            sign = '+' if cm.amount >= 0 else ''
+            amount = round(cm.amount or 0.0, 2)
+            sign = '+' if amount >= 0 else '-'
+            kind = _("CASH IN") if amount > 0 else (
+                _("CASH OUT") if amount < 0 else _("CASH")
+            )
+            ref = cm.payment_ref or _('(sans libelle)')
+            move_ref = (cm.move_id.name if cm.move_id else '') or _('(non poste)')
             cash_moves_lines.append(
-                "<li>%s : %s%s</li>" % (
-                    cm.payment_ref or _('(sans libelle)'),
+                "<li>[%s] <b>%s</b> &mdash; %s : %s%s</li>" % (
+                    kind,
+                    move_ref,
+                    ref,
                     sign,
-                    cm.amount,
+                    self._fmt_money(abs(amount)),
                 )
             )
         cash_moves_html = (
@@ -288,9 +329,9 @@ class PosSession(models.Model):
             "<br/>"
             "<u>Mouvements de caisse :</u>%(moves)s",
             hour=now_str,
-            start=balance_start,
-            expected=expected_cash,
-            end=expected_cash,
+            start=self._fmt_money(balance_start),
+            expected=self._fmt_money(expected_cash),
+            end=self._fmt_money(expected_cash),
             moves=cash_moves_html,
         )
         self.message_post(
@@ -319,6 +360,82 @@ class PosSession(models.Model):
 
         # Pass through any wizard/action returned by core close.
         return close_result
+
+    # ---------------------------------------------------------------------
+    # Manual force-close (bypass hour check)
+    # ---------------------------------------------------------------------
+    def action_force_auto_close(self):
+        """Force fermeture auto sans verifier l'heure cible.
+
+        Reuse `_auto_close_session()` (calcul balance + close + email).
+        Garde les protections: opening_control, draft orders, opted-out PdV.
+        Multi-record safe : itere et catche erreurs par session.
+        """
+        closed = []
+        skipped = []
+        for session in self:
+            config = session.config_id
+            if not config.auto_close_enabled:
+                skipped.append((session.name, "PdV %s opted out" % config.name))
+                continue
+            if session.state == 'opening_control':
+                skipped.append((session.name, "opening_control"))
+                continue
+            if session.state != 'opened':
+                skipped.append((session.name, "state=%s" % session.state))
+                continue
+            draft = session.order_ids.filtered(lambda o: o.state == 'draft')
+            if draft:
+                skipped.append((session.name, "%d draft order(s)" % len(draft)))
+                continue
+            try:
+                session._auto_close_session()
+                closed.append(session.name)
+            except Exception as exc:  # noqa: BLE001
+                _logger.error(
+                    "[pos_auto_close] Force close %s failed: %s\n%s",
+                    session.name, exc, traceback.format_exc(),
+                )
+                skipped.append((session.name, "error: %s" % exc))
+
+        _logger.info(
+            "[pos_auto_close] Force close batch: closed=%s skipped=%s",
+            closed, skipped,
+        )
+        msg_lines = []
+        if closed:
+            msg_lines.append(_("Fermees : %s") % ", ".join(closed))
+        if skipped:
+            msg_lines.append(_("Ignorees : %s") % "; ".join(
+                "%s (%s)" % (n, r) for n, r in skipped
+            ))
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'title': _("Fermeture forcee"),
+                'message': "\n".join(msg_lines) or _("Aucune session a traiter."),
+                'type': 'success' if closed else 'warning',
+                'sticky': bool(skipped),
+            }
+        }
+
+    @api.model
+    def _force_auto_close_all(self):
+        """Server-action entry point: ferme toutes les sessions opened, bypass heure."""
+        sessions = self.search([('state', '=', 'opened')])
+        if not sessions:
+            return {
+                'type': 'ir.actions.client',
+                'tag': 'display_notification',
+                'params': {
+                    'title': _("Fermeture forcee"),
+                    'message': _("Aucune session ouverte."),
+                    'type': 'warning',
+                    'sticky': False,
+                },
+            }
+        return sessions.action_force_auto_close()
 
     # ---------------------------------------------------------------------
     # Email notification

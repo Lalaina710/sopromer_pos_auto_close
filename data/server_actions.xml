@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright 2026 SOPROMER
+     License LGPL-3.0 or later (https://www.gnu.org/licenses/lgpl). -->
+<odoo>
+    <data noupdate="0">
+
+        <!-- Action serveur globale : ferme toutes les sessions opened.
+             Visible dans Settings > Technical > Server Actions. -->
+        <record id="action_force_close_all_sessions" model="ir.actions.server">
+            <field name="name">SOPROMER : Forcer fermeture auto sessions POS (toutes)</field>
+            <field name="model_id" ref="point_of_sale.model_pos_session"/>
+            <field name="state">code</field>
+            <field name="code">action = model._force_auto_close_all()</field>
+        </record>
+
+        <!-- Action contextuelle : visible dans le menu "Action" de la liste/form
+             des sessions POS. Permet de selectionner 1 ou plusieurs sessions
+             et forcer la fermeture (bypass heure). -->
+        <record id="action_force_close_selected_sessions" model="ir.actions.server">
+            <field name="name">SOPROMER : Forcer fermeture auto (selection)</field>
+            <field name="model_id" ref="point_of_sale.model_pos_session"/>
+            <field name="binding_model_id" ref="point_of_sale.model_pos_session"/>
+            <field name="binding_view_types">list,form</field>
+            <field name="state">code</field>
+            <field name="code">action = records.action_force_auto_close()</field>
+        </record>
+
+    </data>
+</odoo>

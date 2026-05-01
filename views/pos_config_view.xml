@@ -14,6 +14,10 @@
                 <group string="Fermeture automatique" name="auto_close_group">
                     <field name="auto_close_enabled"/>
                     <field name="auto_close_hour_override"
+                           string="Heure (HH) override"
+                           invisible="not auto_close_enabled"/>
+                    <field name="auto_close_minute_override"
+                           string="Minute (MM) override"
                            invisible="not auto_close_enabled"/>
                     <field name="auto_close_email_to_override"
                            placeholder="responsable.pdv@sopromer.mg"

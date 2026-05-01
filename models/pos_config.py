@@ -4,7 +4,8 @@
 from odoo import fields, models
 
 
-HOUR_SELECTION = [("%02d" % h, "%02d:00" % h) for h in range(24)]
+HOUR_SELECTION = [("%02d" % h, "%02d" % h) for h in range(24)]
+MINUTE_SELECTION = [("%02d" % m, "%02d" % m) for m in range(0, 60, 5)]
 
 
 class PosConfig(models.Model):
@@ -21,11 +22,20 @@ class PosConfig(models.Model):
     )
     auto_close_hour_override = fields.Selection(
         selection=HOUR_SELECTION,
-        string="Heure de fermeture (override)",
+        string="Heure (HH) override",
         help=(
             "Si defini, surcharge l'heure de fermeture globale pour ce PdV. "
             "Laisser vide pour utiliser l'heure globale configuree dans les "
             "parametres Point de Vente."
+        ),
+    )
+    auto_close_minute_override = fields.Selection(
+        selection=MINUTE_SELECTION,
+        string="Minute (MM) override",
+        help=(
+            "Si defini, surcharge la minute de fermeture globale pour ce PdV. "
+            "Granularite 5 minutes (cron tourne toutes les 5 min). "
+            "Laisser vide pour utiliser la minute globale."
         ),
     )
     auto_close_email_to_override = fields.Char(

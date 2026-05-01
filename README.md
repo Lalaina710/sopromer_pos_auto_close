@@ -231,6 +231,52 @@ pas de modele custom, pas d'asset frontend.
 
 ## Historique des versions
 
+### 18.0.1.3.2 - 2026-05-01
+
+- Email/chatter mouvements de caisse : afficher le **numéro Sage** du move
+  (`account.move.name`, ex `CSE8/26-27/0063`) au lieu du seul `payment_ref`
+- Format `[TYPE] <num move> — <payment_ref> : <signe><montant>`
+- Source : `cm.move_id.name`
+
+### 18.0.1.3.1 - 2026-05-01
+
+- Helper `_fmt_money(amount)` : format français milliers/décimales
+  (`857300.0` → `857 300,00`, `361767.04000000004` → `361 767,04`)
+- Tag explicite `[CASH IN]` / `[CASH OUT]` selon signe du mouvement
+- Vue Settings et form pos.config : 2 lignes séparées HH / MM (au lieu de
+  side-by-side qui rendait les selects collés visuellement)
+
+### 18.0.1.3.0 - 2026-05-01
+
+- Ajout champ **Minute (MM)** override par PdV (`auto_close_minute_override`)
+  + globale ICP `sopromer_pos_auto_close.minute_global`
+- Selection `MINUTE_SELECTION` step 5 (00, 05, 10, ..., 55)
+- Cron principal passé de `1 hours` à `5 minutes` pour respecter granularité
+- Logique dispatch : fenêtre `[target_total, target_total+5min[` (idempotent
+  via check `state='opened'`)
+- Helper `_read_int_icp(IrConfig, key)` factorisé
+
+### 18.0.1.2.1 - 2026-05-01
+
+- Nouveau cron de test **`SOPROMER : [TEST] Forcer fermeture sessions POS
+  (manuel)`** dans `data/ir_cron.xml`
+- `active=False` + `nextcall=+10ans` → ne fire pas auto, mais "Exécuter
+  manuellement" déclenche immédiatement
+- Code : `model._force_auto_close_all()` (bypass check heure)
+
+### 18.0.1.2.0 - 2026-05-01
+
+- Méthode publique `action_force_auto_close()` sur `pos.session` : force la
+  fermeture en réutilisant `_auto_close_session()`, bypass check heure mais
+  garde protections (opening_control, draft orders, opted-out)
+- Méthode `_force_auto_close_all()` : entry point pour cron / server action
+- 2 server actions dans `data/server_actions.xml` :
+  - "SOPROMER : Forcer fermeture auto sessions POS (toutes)" — globale
+    via Settings > Technique > Actions serveur
+  - "SOPROMER : Forcer fermeture auto (sélection)" — contextuelle, menu
+    Action de la liste/form pos.session (binding model)
+- Notification client `display_notification` avec liste fermées / ignorées
+
 ### 18.0.1.1.5 - 2026-04-30
 
 - Heure globale vide (ICP non défini ou '') → cron **skip silencieusement**

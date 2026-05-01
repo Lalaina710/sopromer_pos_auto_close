@@ -4,7 +4,8 @@
 from odoo import fields, models
 
 
-HOUR_SELECTION = [("%02d" % h, "%02d:00" % h) for h in range(24)]
+HOUR_SELECTION = [("%02d" % h, "%02d" % h) for h in range(24)]
+MINUTE_SELECTION = [("%02d" % m, "%02d" % m) for m in range(0, 60, 5)]
 
 
 class ResConfigSettings(models.TransientModel):
@@ -22,13 +23,23 @@ class ResConfigSettings(models.TransientModel):
     )
     pos_auto_close_hour_global = fields.Selection(
         selection=HOUR_SELECTION,
-        string="Heure de fermeture automatique (globale)",
+        string="Heure (HH) globale",
         config_parameter='sopromer_pos_auto_close.hour_global',
         default='19',
         help=(
             "Heure a laquelle le cron declenche la fermeture des sessions "
             "POS ouvertes (fuseau de la societe). Peut etre surcharge par "
             "PdV. Format 24h."
+        ),
+    )
+    pos_auto_close_minute_global = fields.Selection(
+        selection=MINUTE_SELECTION,
+        string="Minute (MM) globale",
+        config_parameter='sopromer_pos_auto_close.minute_global',
+        default='00',
+        help=(
+            "Minute a laquelle le cron declenche la fermeture (granularite "
+            "5 min). Peut etre surchargee par PdV."
         ),
     )
     pos_auto_close_email_to = fields.Char(
