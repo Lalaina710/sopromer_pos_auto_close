@@ -27,7 +27,14 @@ physique n'est requis : tous les flux cash sont deja traces dans Odoo
 |--------|--------------------------|
 | `res.config.settings` | `pos_auto_close_enabled`, `pos_auto_close_hour_global`, `pos_auto_close_email_to` (ICP) |
 | `pos.config` | `auto_close_enabled`, `auto_close_hour_override`, `auto_close_email_to_override` |
-| `pos.session` | `_cron_auto_close_sessions()`, `_auto_close_dispatch()`, `_auto_close_session()`, `_send_auto_close_email()`, `_resolve_auto_close_email_recipients()` |
+| `pos.session` | `_cron_auto_close_sessions()`, `_auto_close_dispatch()`, `_auto_close_session()`, `_send_consolidated_auto_close_email()`, `_resolve_auto_close_email_recipients()` |
+
+Depuis v18.0.1.4.0, `_auto_close_session()` ne déclenche plus l'envoi email
+unitaire : la méthode retourne un dict (payload) décrivant la session fermée
+(nom, PdV, heure, soldes, mouvements de caisse). Le cron accumule les payloads
+de toutes les sessions fermées pendant le run, puis appelle
+`_send_consolidated_auto_close_email(closed_results)` une fois en fin de run
+pour envoyer **un seul email regroupant toutes les sessions**.
 
 Aucun nouveau modele : pas de `ir.model.access.csv` necessaire.
 
@@ -67,10 +74,26 @@ chatter.
 
 ## Notification email
 
-Apres chaque fermeture automatique reussie, un email est envoye au(x)
-destinataire(s) configure(s). Le contenu reprend le message poste dans le
-chatter (solde initial, solde theorique, solde de cloture, mouvements de
-caisse).
+Depuis v18.0.1.4.0, le module envoie **un seul email consolidé par run du
+cron**, regroupant toutes les sessions fermées pendant ce run. Auparavant,
+1 mail était envoyé par session fermée : avec 40 PdV SOPROMER fermant
+simultanément à 19h00, cela produisait jusqu'à 40 mails identiques en
+quelques minutes. Le mail consolidé est plus lisible et réduit la pression
+SMTP / la pollution boîte de réception.
+
+### Comportement
+
+- **1 mail unique par run cron** (pas 1 par session), même si N sessions
+  sont fermées dans le batch
+- **Destinataires** : union des recipients résolus pour chaque PdV fermé
+  + ICP global `pos_auto_close_email_to`, **dédupliqués**
+- **Chatter per-session préservé** : chaque session fermée reçoit toujours
+  son message détaillé dans le chatter (audit individuel utile)
+- **`auto_delete=True`** : le `mail.mail` est supprimé après envoi (pas de
+  persistance d'état `sent` dans la base)
+- **Tolérance erreur globale** : exception attrapée + loggée
+  (`_logger.error()`) en fin de run, ne bloque pas le cron ni les fermetures
+  déjà effectuées
 
 ### Configuration des destinataires (2 niveaux)
 
@@ -79,36 +102,78 @@ caisse).
 | Global | `pos_auto_close_email_to` (Settings -> Point de Vente) | ICP `sopromer_pos_auto_close.email_to` | 1 ou plusieurs emails separes par `,` ou `;` |
 | PdV | `auto_close_email_to_override` (form pos.config) | Champ direct | Idem |
 
-Resolution :
+Résolution par session fermée :
 
 1. Si l'override PdV est rempli -> utilise cette adresse
 2. Sinon -> fallback sur le destinataire global
-3. Si les deux sont vides -> aucun email envoye (skip silencieux)
+3. Tous les emails résolus de toutes les sessions du run + ICP global sont
+   ensuite **unifiés et dédupliqués** pour produire la liste finale du
+   mail consolidé
+4. Si la liste finale est vide -> aucun email envoyé (skip silencieux)
 
 ### Exemples
 
 | PdV | Override PdV | Global | Destinataire effectif |
 |-----|--------------|--------|----------------------|
 | Magasin A | (vide) | `compta@sopromer.mg` | compta@sopromer.mg |
-| Magasin B | `directeur.b@sopromer.mg` | `compta@sopromer.mg` | directeur.b@sopromer.mg |
-| Magasin C | `manager@x; super@y` | -- | manager@x ET super@y |
+| Magasin B | `directeur.b@sopromer.mg` | `compta@sopromer.mg` | directeur.b@sopromer.mg, compta@sopromer.mg |
+| Magasin C | `manager@x; super@y` | -- | manager@x, super@y |
 | Magasin D | (vide) | (vide) | aucun email envoye |
 
-### Format email
+Si Magasin A, B, C ferment dans le même run, le mail consolidé est envoyé à
+`compta@sopromer.mg, directeur.b@sopromer.mg, manager@x, super@y` (union
+dédupliquée).
 
-- **Subject** : `[SOPROMER] Session POS auto-fermee - <session.name> (<pos_config.name>)`
-- **Body HTML** : intro + meme contenu que le chatter (balance_start, expected,
-  balance_end_real, liste des mouvements de caisse)
-- **From** : `company.email` ou fallback `noreply@sopromer.mg`
+### Format du mail consolidé
+
+- **Sujet** : `[SOPROMER] Cloture automatique POS - DD/MM/YYYY (N session(s))`
+  où `DD/MM/YYYY` est la date du run et `N` le nombre de sessions fermées
+- **Body QWeb** : intro + 1 section par PdV fermé, chaque section contient :
+  - heure de fermeture
+  - solde initial (`balance_start_fmt`)
+  - solde théorique (`expected_fmt`)
+  - solde réel = théorique (`balance_end_real`)
+  - mouvements de caisse en liste à puces (`cash_moves_html`)
+- **From** : `ir.mail_server.smtp_user` (1er actif) ou fallback `company.email`
 - **Mode** : `mail.mail` standard avec `auto_delete=True`, envoi async
 
-### Tolerance erreur
+### Édition du template via UI
 
-Si l'envoi email echoue (DNS, SMTP down, adresse invalide) :
+Le contenu HTML du mail consolidé est désormais **éditable sans
+redéploiement** via un `mail.template` standard Odoo.
 
-- `_logger.error()` avec stack trace complet
-- La fermeture de session reste **valide** (pas de rollback)
-- Le cron continue avec les autres sessions
+- **Path UI** : Settings → Technique → Email → Modèles → chercher
+  "SOPROMER : Cloture POS auto - rapport consolide"
+- **External ID** : `sopromer_pos_auto_close.mail_template_consolidated`
+- **Fichier source** : `data/mail_template_auto_close.xml` (`noupdate=1` →
+  modifications UI préservées lors d'un upgrade)
+
+Variables disponibles dans le QWeb (`ctx` = `email_values['email_context']`) :
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `ctx['sessions']` | list[dict] | Liste des sessions fermées dans le run |
+| `ctx['count']` | int | Nombre de sessions fermées |
+| `ctx['date_str']` | str | Date du run au format `DD/MM/YYYY` |
+| `ctx['email_from']` | str | Adresse expéditeur résolue |
+| `ctx['email_to']` | str | Liste destinataires dédupliquée (séparés `,`) |
+
+Chaque entrée de `ctx['sessions']` est un dict :
+
+| Clé | Type | Description |
+|-----|------|-------------|
+| `name` | str | Nom de la session (ex `POS/00496`) |
+| `pdv` | str | Nom du PdV (`pos.config.name`) |
+| `now_str` | str | Heure de fermeture format `HH:MM` |
+| `balance_start_fmt` | str | Solde initial formaté FR (`857 300,00`) |
+| `expected_fmt` | str | Solde théorique formaté FR |
+| `cash_moves_html` | `Markup` | HTML pré-rendu de la liste `<ul><li>` des mouvements de caisse |
+
+> **Note importante** : `cash_moves_html` est wrappé en `markupsafe.Markup`
+> côté Python depuis v18.0.1.4.1, donc `<t t-out="ctx['sessions'][i]['cash_moves_html']"/>`
+> dans le QWeb rend le HTML brut (balises `<ul><li>` interprétées comme
+> structure) au lieu de l'échapper en texte brut. Si tu modifies le template
+> et veux afficher ce champ, utilise toujours `t-out` (jamais `t-esc`).
 
 ## Configuration (2 niveaux)
 
@@ -229,7 +294,67 @@ pas de modele custom, pas d'asset frontend.
 - Si besoin de tester en douceur : passer a `auto_close_enabled = False`
   globalement, activer PdV par PdV.
 
+### Gotcha Odoo 18 : nouveau fichier XML data ignoré par `-u`
+
+Depuis v18.0.1.4.0, le module embarque un nouveau fichier
+`data/mail_template_auto_close.xml`. Sur un module **déjà installé** (cas
+upgrade 45 ou 43), un simple `-u sopromer_pos_auto_close` peut ignorer
+silencieusement ce nouveau fichier `data` : le `mail.template` n'est alors
+pas créé en base et l'envoi du mail consolidé échoue (`ValueError: External
+ID not found: sopromer_pos_auto_close.mail_template_consolidated`).
+
+**Avant l'upgrade**, forcer le state du module en SQL :
+
+```sql
+UPDATE ir_module_module
+SET state='to upgrade'
+WHERE name='sopromer_pos_auto_close';
+```
+
+Puis lancer l'upgrade + restart container, et **valider en post-deploy** que
+le template est bien présent :
+
+```sql
+SELECT id, name
+FROM mail_template
+WHERE name LIKE 'SOPROMER%Cloture%';
+-- doit retourner 1 ligne : "SOPROMER : Cloture POS auto - rapport consolide"
+```
+
+Si la requête retourne 0 ligne, refaire un upgrade complet du module via
+Apps UI ("Mettre à jour"), pas un `-u` ligne de commande.
+
 ## Historique des versions
+
+### 18.0.1.4.1 - 2026-05-22
+
+- **Fix** : `cash_moves_html` wrappé dans `markupsafe.Markup` pour éviter
+  l'échappement HTML par `t-out` Odoo 18 (sinon balises `<ul><li>` affichées
+  brutes dans le mail au lieu d'être rendues en liste à puces)
+- Import `from markupsafe import Markup` ajouté en tête de `pos_session.py`
+- Validé runtime 45 SOPROMER-REST200526 : 3 sessions test → mail consolidé
+  reçu avec rendu HTML correct
+
+### 18.0.1.4.0 - 2026-05-22
+
+- **Feature majeure** : email consolidé — 1 SEUL mail par run cron au lieu
+  d'1 mail par session fermée
+- Nouveau `mail.template` éditable via UI : `mail_template_consolidated`
+  (`data/mail_template_auto_close.xml`, `noupdate=1`)
+- Path UI éditable : Settings → Technique → Email → Modèles
+- Sujet : `[SOPROMER] Cloture automatique POS - DD/MM/YYYY (N session(s))`
+- Body QWeb avec `t-foreach="ctx['sessions']"` → 1 section par PdV fermé
+- Destinataires : union override PdV + ICP global, dédupliqués
+- Refactor cron : `_auto_close_session` retourne payload dict, cron accumule
+  puis appelle `_send_consolidated_auto_close_email(closed_results)` en fin
+- Méthode `_send_auto_close_email` supprimée (remplacée)
+- `action_force_auto_close` et `_force_auto_close_all` empruntent le même
+  chemin consolidé
+- Chatter per-session **préservé** (audit individuel utile)
+- Tolerance erreur globale autour du send consolidé (try/except, log error,
+  ne bloque pas le cron)
+- Validé runtime 45 : 4 sessions test (force-close batch) → 1 mail envoyé
+  à Fitahiana + Joël, sujet `(4 session(s))`, SMTP send OK
 
 ### 18.0.1.3.2 - 2026-05-01
 
