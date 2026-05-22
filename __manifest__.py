@@ -3,7 +3,7 @@
 # License LGPL-3.0 or later (https://www.gnu.org/licenses/lgpl).
 {
     'name': 'SOPROMER POS Auto Close',
-    'version': '18.0.1.3.2',
+    'version': '18.0.1.4.1',
     'category': 'Point of Sale',
     'summary': 'Fermeture automatique sessions POS avec calcul auto balance + notification email',
     'description': """
@@ -47,6 +47,7 @@ que tous les PdV demarrent une nouvelle session le lendemain matin.
         'mail',
     ],
     'data': [
+        'data/mail_template_auto_close.xml',
         'data/ir_cron.xml',
         'data/server_actions.xml',
         'views/pos_config_view.xml',

@@ -7,6 +7,7 @@ import traceback
 from datetime import datetime
 
 import pytz
+from markupsafe import Markup
 
 from odoo import _, api, models
 
@@ -27,9 +28,13 @@ class PosSession(models.Model):
         """Iterate opened POS sessions and auto-close those whose target
         hour matches the current hour in the company timezone.
 
-        Called every hour by ir.cron `sopromer_pos_auto_close.ir_cron_auto_close`.
+        Called every 5 minutes by ir.cron `sopromer_pos_auto_close.ir_cron_auto_close`.
         Wraps each session in its own try/except so one failure does not stop
         the whole batch.
+
+        Accumulates results in `closed_results` (one dict per closed session)
+        and sends 1 CONSOLIDATED email at the end of the run. Per-session
+        chatter post stays for individual audit.
         """
         IrConfig = self.env['ir.config_parameter'].sudo()
         enabled_global = IrConfig.get_param(
@@ -61,9 +66,12 @@ class PosSession(models.Model):
             "%02d:%02d" % (global_hour, global_minute) if global_hour is not None else "(empty)",
         )
 
+        closed_results = []
         for session in opened_sessions:
             try:
-                self._auto_close_dispatch(session, global_hour, global_minute)
+                result = self._auto_close_dispatch(session, global_hour, global_minute)
+                if result:
+                    closed_results.append(result)
             except Exception as exc:  # noqa: BLE001
                 # Defensive: never let one session crash the whole cron.
                 _logger.error(
@@ -83,6 +91,16 @@ class PosSession(models.Model):
                     # Chatter post should never break the loop either.
                     pass
 
+        # 1 consolidated email for the whole run.
+        if closed_results:
+            try:
+                self._send_consolidated_auto_close_email(closed_results)
+            except Exception as exc:  # noqa: BLE001
+                _logger.error(
+                    "[pos_auto_close] Consolidated email failed: %s\n%s",
+                    exc, traceback.format_exc(),
+                )
+
     @api.model
     def _fmt_money(self, amount):
         """Format montant avec espace milliers, virgule decimale, 2 chiffres.
@@ -94,7 +112,7 @@ class PosSession(models.Model):
             return str(amount)
         s = "{:,.2f}".format(v)  # ex '857,300.00'
         # FR : remplace , par espace et . par ,
-        return s.replace(',', ' ').replace('.', ',').replace(' ', ' ')
+        return s.replace(',', ' ').replace('.', ',').replace(' ', ' ')
 
     @api.model
     def _read_int_icp(self, IrConfig, key):
@@ -114,6 +132,10 @@ class PosSession(models.Model):
     def _auto_close_dispatch(self, session, global_hour, global_minute=0):
         """Decide whether `session` must be closed now and act accordingly.
 
+        Returns:
+          dict payload of closed session (suitable for consolidated email)
+          OR None if skipped/not matching window.
+
         Skips silently when:
           - the PdV opted out (auto_close_enabled = False)
           - the current time is not within target window (5-min window)
@@ -126,7 +148,7 @@ class PosSession(models.Model):
                 "[pos_auto_close] Session %s: PdV %s opted out, skip.",
                 session.name, config.name,
             )
-            return
+            return None
 
         # Priorité override PdV > heure globale.
         # Si heure globale ET override PdV vides → skip silencieux.
@@ -140,7 +162,7 @@ class PosSession(models.Model):
                 "[pos_auto_close] Session %s: no hour configured (override + global empty), skip.",
                 session.name,
             )
-            return
+            return None
 
         # Minute : override PdV > globale > 0.
         override_m = config.auto_close_minute_override
@@ -167,7 +189,7 @@ class PosSession(models.Model):
         # Fenêtre 5 min (cron tourne toutes les 5 min). Idempotence garantie
         # par le check state='opened' (session déjà closed = skip à la prochaine).
         if not (target_total <= current_total < target_total + 5):
-            return
+            return None
 
         # Edge case 1: opening_control (cashier never validated opening)
         if session.state == 'opening_control':
@@ -184,7 +206,7 @@ class PosSession(models.Model):
                 message_type='comment',
                 subtype_xmlid='mail.mt_note',
             )
-            return
+            return None
 
         # Edge case 2: draft orders still pending
         draft_orders = session.order_ids.filtered(lambda o: o.state == 'draft')
@@ -206,22 +228,25 @@ class PosSession(models.Model):
                     count=len(draft_orders),
                 ),
             )
-            return
+            return None
 
         # OK to close
-        session._auto_close_session()
+        return session._auto_close_session()
 
     # ---------------------------------------------------------------------
     # Per-session close
     # ---------------------------------------------------------------------
     def _auto_close_session(self):
-        """Close `self` automatically.
+        """Close `self` automatically and return payload dict for the
+        consolidated email.
 
         Logic:
           1. Move to closing_control (triggers Odoo's cash balance compute)
           2. Set balance_end_real := computed expected balance
           3. Finalize close
-          4. Post detailed message in chatter
+          4. Post detailed message in chatter (audit individuel : KEPT)
+          5. Return dict {session, balance_start, expected_cash, now_str,
+                          cash_moves_html} → consume par consolidated email.
 
         Must be called on a single session (ensure_one). Caller wraps in
         try/except.
@@ -284,9 +309,7 @@ class PosSession(models.Model):
         # Refresh after state change.
         self = self.exists()
         if not self:
-            return
-
-        close_result = None
+            return None
 
         if self.state == 'closed':
             _logger.info(
@@ -295,9 +318,9 @@ class PosSession(models.Model):
             )
         else:
             # 3. Si encore en closing_control, finaliser le close.
-            close_result = self.action_pos_session_close()
+            self.action_pos_session_close()
 
-        # 4. Detailed audit message in chatter.
+        # 4. Detailed audit message in chatter (per-session = KEPT).
         cash_moves_lines = []
         for cm in self.statement_line_ids:
             amount = round(cm.amount or 0.0, 2)
@@ -316,9 +339,15 @@ class PosSession(models.Model):
                     self._fmt_money(abs(amount)),
                 )
             )
+        # Wrap en Markup pour que t-out (Odoo 18) ne ré-échappe pas le HTML
+        # dans le template QWeb du mail consolidé. Sans Markup, le rendu
+        # affiche les balises brutes (<ul><li>...) au lieu de la liste.
         cash_moves_html = (
-            "<ul>%s</ul>" % "".join(cash_moves_lines)
-            if cash_moves_lines else _("<i>aucun mouvement de caisse</i>")
+            Markup("<ul>%s</ul>") % Markup("").join(
+                Markup(line) for line in cash_moves_lines
+            )
+            if cash_moves_lines
+            else Markup(_("<i>aucun mouvement de caisse</i>"))
         )
 
         body = _(
@@ -345,21 +374,15 @@ class PosSession(models.Model):
             self.name, balance_start, expected_cash,
         )
 
-        # 5. Best-effort email notification (never block close on failure).
-        try:
-            self._send_auto_close_email(
-                body_html=body,
-                expected_cash=expected_cash,
-                balance_start=balance_start,
-            )
-        except Exception as exc:  # noqa: BLE001
-            _logger.error(
-                "[pos_auto_close] Session %s: email notification failed: %s\n%s",
-                self.name, exc, traceback.format_exc(),
-            )
-
-        # Pass through any wizard/action returned by core close.
-        return close_result
+        # Payload consume by consolidated email. NB: pas d'envoi mail ici,
+        # tout est centralise dans _send_consolidated_auto_close_email.
+        return {
+            'session': self,
+            'balance_start': balance_start,
+            'expected_cash': expected_cash,
+            'now_str': now_str,
+            'cash_moves_html': cash_moves_html,
+        }
 
     # ---------------------------------------------------------------------
     # Manual force-close (bypass hour check)
@@ -367,12 +390,14 @@ class PosSession(models.Model):
     def action_force_auto_close(self):
         """Force fermeture auto sans verifier l'heure cible.
 
-        Reuse `_auto_close_session()` (calcul balance + close + email).
+        Reuse `_auto_close_session()` (calcul balance + close).
         Garde les protections: opening_control, draft orders, opted-out PdV.
         Multi-record safe : itere et catche erreurs par session.
+        Accumule resultats et envoie 1 SEUL email consolide a la fin.
         """
         closed = []
         skipped = []
+        closed_results = []
         for session in self:
             config = session.config_id
             if not config.auto_close_enabled:
@@ -389,7 +414,9 @@ class PosSession(models.Model):
                 skipped.append((session.name, "%d draft order(s)" % len(draft)))
                 continue
             try:
-                session._auto_close_session()
+                result = session._auto_close_session()
+                if result:
+                    closed_results.append(result)
                 closed.append(session.name)
             except Exception as exc:  # noqa: BLE001
                 _logger.error(
@@ -397,6 +424,16 @@ class PosSession(models.Model):
                     session.name, exc, traceback.format_exc(),
                 )
                 skipped.append((session.name, "error: %s" % exc))
+
+        # 1 mail consolide pour le batch force-close.
+        if closed_results:
+            try:
+                self._send_consolidated_auto_close_email(closed_results)
+            except Exception as exc:  # noqa: BLE001
+                _logger.error(
+                    "[pos_auto_close] Force close consolidated email failed: %s\n%s",
+                    exc, traceback.format_exc(),
+                )
 
         _logger.info(
             "[pos_auto_close] Force close batch: closed=%s skipped=%s",
@@ -438,7 +475,7 @@ class PosSession(models.Model):
         return sessions.action_force_auto_close()
 
     # ---------------------------------------------------------------------
-    # Email notification
+    # Email notification (consolide)
     # ---------------------------------------------------------------------
     def _resolve_auto_close_email_recipients(self):
         """Return cleaned email recipient list for `self`.
@@ -465,19 +502,42 @@ class PosSession(models.Model):
             if addr and addr.strip()
         ]
 
-    def _send_auto_close_email(self, body_html, expected_cash, balance_start):
-        """Send email notification after a successful auto-close.
+    @api.model
+    def _send_consolidated_auto_close_email(self, closed_results):
+        """Send ONE consolidated email for all closed sessions in this run.
 
-        Silently skips when no recipient is configured. Caller wraps in
-        try/except so any SMTP/DNS error is swallowed and never blocks the
-        cron loop.
+        Args:
+          closed_results: list[dict] returned by _auto_close_session, each
+            containing keys session, balance_start, expected_cash, now_str,
+            cash_moves_html.
+
+        Recipients: union des destinataires de chaque session (override PdV
+        sinon global ICP), dedupliques en preservant l'ordre.
+
+        Skip silencieux si liste vide ou aucun destinataire resolu.
+
+        Le template est attache a pos.session ; on rend avec la 1ere session
+        en res_id pour fournir un record d'attache (chatter / followers du
+        template), mais le corps utilise UNIQUEMENT le contexte injecte.
         """
-        self.ensure_one()
-        recipients = self._resolve_auto_close_email_recipients()
+        if not closed_results:
+            return
+
+        # Union recipients (dedupe preserve order).
+        recipients = []
+        seen = set()
+        for r in closed_results:
+            session = r['session']
+            for addr in session._resolve_auto_close_email_recipients():
+                key = addr.lower()
+                if key not in seen:
+                    seen.add(key)
+                    recipients.append(addr)
+
         if not recipients:
             _logger.info(
-                "[pos_auto_close] Session %s: no email recipient, skip mail.",
-                self.name,
+                "[pos_auto_close] Consolidated email: %d session(s) closed but no recipient configured, skip.",
+                len(closed_results),
             )
             return
 
@@ -487,7 +547,8 @@ class PosSession(models.Model):
         mail_server = self.env['ir.mail_server'].sudo().search(
             [], order='sequence, id', limit=1,
         )
-        company = self.company_id or self.env.company
+        first_session = closed_results[0]['session']
+        company = first_session.company_id or self.env.company
         email_from = (
             (mail_server.smtp_user if mail_server else None)
             or company.email
@@ -496,31 +557,57 @@ class PosSession(models.Model):
         )
         email_to = ', '.join(recipients)
 
-        subject = _(
-            "[SOPROMER] Session POS auto-fermee - %(session)s (%(pdv)s)",
-            session=self.name,
-            pdv=self.config_id.name,
-        )
+        company_tz = company.partner_id.tz or 'Indian/Antananarivo'
+        try:
+            tz = pytz.timezone(company_tz)
+        except pytz.UnknownTimeZoneError:
+            tz = pytz.timezone('Indian/Antananarivo')
+        date_str = datetime.now(tz).strftime('%d/%m/%Y')
 
-        intro = _(
-            "<p>Notification automatique : la session POS "
-            "<b>%(session)s</b> du PdV <b>%(pdv)s</b> a ete fermee "
-            "automatiquement.</p>",
-            session=self.name,
-            pdv=self.config_id.name,
-        )
-        full_body = intro + body_html
-
-        mail_vals = {
-            'subject': subject,
-            'body_html': full_body,
+        # Build ctx payload: list de dicts serialisables pour QWeb.
+        sessions_payload = [
+            {
+                'name': r['session'].name,
+                'pdv': r['session'].config_id.name,
+                'now_str': r['now_str'],
+                'balance_start_fmt': self._fmt_money(r['balance_start']),
+                'expected_fmt': self._fmt_money(r['expected_cash']),
+                'cash_moves_html': r['cash_moves_html'],
+            }
+            for r in closed_results
+        ]
+        ctx = {
+            'sessions': sessions_payload,
+            'count': len(closed_results),
+            'date_str': date_str,
             'email_from': email_from,
             'email_to': email_to,
-            'auto_delete': True,
         }
-        mail = self.env['mail.mail'].sudo().create(mail_vals)
-        mail.send()  # async send via mail.mail standard pipeline
+
+        try:
+            template = self.env.ref(
+                'sopromer_pos_auto_close.mail_template_consolidated'
+            )
+        except ValueError:
+            _logger.error(
+                "[pos_auto_close] Template mail_template_consolidated introuvable, "
+                "skip email consolide."
+            )
+            return
+
+        # send_mail avec res_id = 1ere session (template attache pos.session).
+        # email_values override email_to/email_from au cas ou le template
+        # produit du vide (defense en profondeur).
+        template.with_context(**ctx).send_mail(
+            first_session.id,
+            force_send=False,
+            email_values={
+                'email_to': email_to,
+                'email_from': email_from,
+                'auto_delete': True,
+            },
+        )
         _logger.info(
-            "[pos_auto_close] Session %s: email queued to %s (mail.id=%s).",
-            self.name, email_to, mail.id,
+            "[pos_auto_close] Consolidated email queued: %d session(s) -> %s",
+            len(closed_results), email_to,
         )

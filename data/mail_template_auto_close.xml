@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright 2026 SOPROMER
+     License LGPL-3.0 or later (https://www.gnu.org/licenses/lgpl). -->
+<odoo>
+    <data noupdate="1">
+
+        <!--
+            Template email consolide envoye en fin de cron _cron_auto_close_sessions.
+            1 SEUL email regroupe toutes les sessions fermees au cours du run.
+
+            Contexte (injecte par _send_consolidated_auto_close_email) :
+              ctx['sessions']   : list[dict] {name, pdv, now_str, balance_start_fmt,
+                                              expected_fmt, cash_moves_html}
+              ctx['count']      : int        nombre de sessions fermees
+              ctx['date_str']   : str        date du run (DD/MM/YYYY)
+              ctx['email_from'] : str        adresse expediteur resolue
+              ctx['email_to']   : str        destinataires (CSV)
+
+            Le template est attache a pos.session pour pouvoir etre rendu via
+            send_mail(res_id) ; le res_id passe est la 1ere session fermee. Le
+            corps n'utilise PAS `object` mais uniquement `ctx` pour rester
+            agnostique au record d'attache.
+
+            Editable via UI : Parametres > Technique > Email > Modeles.
+        -->
+        <record id="mail_template_consolidated" model="mail.template">
+            <field name="name">SOPROMER : Cloture POS auto - rapport consolide</field>
+            <field name="model_id" ref="point_of_sale.model_pos_session"/>
+            <field name="subject">[SOPROMER] Cloture automatique POS - {{ ctx.get('date_str') }} ({{ ctx.get('count') }} session(s))</field>
+            <field name="email_from">{{ ctx.get('email_from') }}</field>
+            <field name="email_to">{{ ctx.get('email_to') }}</field>
+            <field name="auto_delete" eval="True"/>
+            <field name="lang">{{ user.lang or 'fr_FR' }}</field>
+            <field name="body_html" type="html">
+<div style="font-family: Arial, Helvetica, sans-serif; font-size: 13px; color: #2c2c2c;">
+    <p>
+        Notification automatique : <b t-out="ctx.get('count') or 0"/> session(s) POS
+        ont ete fermees automatiquement le <b t-out="ctx.get('date_str')"/>.
+    </p>
+
+    <hr style="border: none; border-top: 1px solid #ddd; margin: 16px 0;"/>
+
+    <t t-foreach="ctx.get('sessions') or []" t-as="s">
+        <div style="margin-bottom: 24px; padding: 12px; border-left: 4px solid #875A7B; background-color: #f9f7fa;">
+            <h3 style="margin: 0 0 8px 0; color: #875A7B;">
+                <t t-out="s.get('name')"/> — <span style="font-weight: normal;" t-out="s.get('pdv')"/>
+            </h3>
+            <table style="width: 100%; border-collapse: collapse; margin-bottom: 8px;">
+                <tr>
+                    <td style="padding: 4px 8px; width: 40%;">Heure de fermeture</td>
+                    <td style="padding: 4px 8px;"><b t-out="s.get('now_str')"/></td>
+                </tr>
+                <tr>
+                    <td style="padding: 4px 8px;">Solde initial</td>
+                    <td style="padding: 4px 8px;"><b t-out="s.get('balance_start_fmt')"/></td>
+                </tr>
+                <tr>
+                    <td style="padding: 4px 8px;">Solde theorique (calcule)</td>
+                    <td style="padding: 4px 8px;"><b t-out="s.get('expected_fmt')"/></td>
+                </tr>
+                <tr>
+                    <td style="padding: 4px 8px;">Solde de cloture reel (auto-rempli)</td>
+                    <td style="padding: 4px 8px;"><b t-out="s.get('expected_fmt')"/></td>
+                </tr>
+            </table>
+            <div style="margin-top: 8px;">
+                <u>Mouvements de caisse :</u>
+                <div t-out="s.get('cash_moves_html')"/>
+            </div>
+        </div>
+    </t>
+
+    <hr style="border: none; border-top: 1px solid #ddd; margin: 16px 0;"/>
+    <p style="font-size: 11px; color: #888;">
+        Email genere automatiquement par le module
+        <b>sopromer_pos_auto_close</b>. Pour modifier le contenu de cet email,
+        Parametres &gt; Technique &gt; Email &gt; Modeles &gt; SOPROMER : Cloture POS auto - rapport consolide.
+    </p>
+</div>
+            </field>
+        </record>
+
+    </data>
+</odoo>
