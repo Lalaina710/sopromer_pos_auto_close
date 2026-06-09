@@ -9,7 +9,7 @@ from datetime import datetime
 import pytz
 from markupsafe import Markup
 
-from odoo import _, api, models
+from odoo import _, api, fields, models
 
 _logger = logging.getLogger(__name__)
 
@@ -19,6 +19,21 @@ _EMAIL_SPLIT_RE = re.compile(r'[;,]')
 
 class PosSession(models.Model):
     _inherit = 'pos.session'
+
+    # Compteur d'échecs consécutifs de fermeture automatique. Sert de
+    # circuit-breaker : au-delà de `sopromer_pos_auto_close.max_retries`
+    # (défaut 3) la session n'est plus retentée par le cron (évite le spam
+    # de chatter sur une session bloquée toute la nuit, ex. picking refusé
+    # par stock_no_negative). Remis à 0 sur fermeture réussie. copy=False
+    # pour ne pas propager le compteur lors d'une duplication.
+    auto_close_fail_count = fields.Integer(
+        string="Échecs fermeture auto",
+        default=0,
+        copy=False,
+        help="Nombre d'échecs consécutifs de la fermeture automatique. "
+             "Au-delà du plafond (ICP max_retries), la session n'est plus "
+             "retentée et doit être fermée manuellement.",
+    )
 
     # ---------------------------------------------------------------------
     # Cron entry point
@@ -55,6 +70,13 @@ class PosSession(models.Model):
         if global_minute is None:
             global_minute = 0
 
+        # Plafond de retries (circuit-breaker anti-spam). Défaut 3. Au-delà,
+        # une session en échec répété est ignorée par le cron (reste 'opened',
+        # fermeture manuelle requise) au lieu de cracher un chatter à chaque tick.
+        max_retries = self._read_int_icp(IrConfig, 'sopromer_pos_auto_close.max_retries')
+        if max_retries is None or max_retries < 1:
+            max_retries = 3
+
         opened_sessions = self.search([('state', '=', 'opened')])
         if not opened_sessions:
             _logger.info("[pos_auto_close] No opened session, nothing to do.")
@@ -68,28 +90,80 @@ class PosSession(models.Model):
 
         closed_results = []
         for session in opened_sessions:
+            # opened_sessions a été lu une fois en début de run. Comme on
+            # commit par session ci-dessous, une session peut déjà avoir été
+            # fermée par une itération précédente (ou un autre worker). On
+            # re-vérifie l'état frais pour ne pas agir sur un recordset stale.
+            session.invalidate_recordset(['state', 'auto_close_fail_count'])
+            if session.state != 'opened':
+                continue
+            # Circuit-breaker : une session ayant déjà échoué max_retries fois
+            # est ignorée (reste 'opened', fermeture manuelle). Évite de
+            # retenter — et donc de logger — toute la nuit une session
+            # définitivement bloquée (ex. picking refusé par stock_no_negative).
+            if session.auto_close_fail_count >= max_retries:
+                _logger.warning(
+                    "[pos_auto_close] Session %s: %d échec(s) >= plafond %d, "
+                    "ignorée (fermeture manuelle requise).",
+                    session.name, session.auto_close_fail_count, max_retries,
+                )
+                continue
             try:
                 result = self._auto_close_dispatch(session, global_hour, global_minute)
                 if result:
                     closed_results.append(result)
+                # Commit par session : isole chaque fermeture dans sa propre
+                # transaction. Un timeout du worker (limit_time_cpu/real) ou une
+                # erreur sur une session suivante ne peut plus annuler les
+                # sessions déjà fermées avec succès dans ce run.
+                self.env.cr.commit()
             except Exception as exc:  # noqa: BLE001
                 # Defensive: never let one session crash the whole cron.
+                # Rollback AVANT toute autre opération : le curseur peut être en
+                # état "aborted" après l'exception, ce qui ferait échouer toute
+                # écriture suivante et empoisonnerait les sessions suivantes.
+                self.env.cr.rollback()
                 _logger.error(
                     "[pos_auto_close] Session %s: unexpected error: %s\n%s",
                     session.name, exc, traceback.format_exc(),
                 )
+                # Incrémente le compteur d'échecs dans une transaction FRAÎCHE
+                # (post-rollback) pour qu'il SURVIVE même si une session
+                # ultérieure rollback. On relit la valeur fraîche car le
+                # rollback a annulé tout write en cours.
+                new_count = None
                 try:
-                    session.message_post(
-                        body=_(
-                            "Erreur fermeture automatique :<br/><pre>%s</pre>",
-                            traceback.format_exc(),
-                        ),
-                        message_type='comment',
-                        subtype_xmlid='mail.mt_note',
-                    )
+                    session.invalidate_recordset(['auto_close_fail_count'])
+                    new_count = session.auto_close_fail_count + 1
+                    session.auto_close_fail_count = new_count
+                    self.env.cr.commit()
                 except Exception:  # noqa: BLE001
-                    # Chatter post should never break the loop either.
-                    pass
+                    # Le write/commit du compteur ne doit jamais casser le batch
+                    # ni laisser le curseur aborted pour la session suivante.
+                    self.env.cr.rollback()
+                    new_count = None
+                # Chatter UNIQUEMENT au 1er échec → stoppe le flood de messages
+                # sur une session bloquée. Les échecs suivants restent dans le log.
+                if new_count == 1:
+                    try:
+                        session.message_post(
+                            body=_(
+                                "Erreur fermeture automatique :<br/><pre>%s</pre>",
+                                traceback.format_exc(),
+                            ),
+                            message_type='comment',
+                            subtype_xmlid='mail.mt_note',
+                        )
+                        self.env.cr.commit()
+                    except Exception:  # noqa: BLE001
+                        # Chatter post should never break the loop either.
+                        self.env.cr.rollback()
+                else:
+                    _logger.warning(
+                        "[pos_auto_close] Session %s: échec n°%s (chatter déjà posté "
+                        "au 1er échec, pas de re-post).",
+                        session.name, new_count if new_count is not None else "?",
+                    )
 
         # 1 consolidated email for the whole run.
         if closed_results:
@@ -186,9 +260,15 @@ class PosSession(models.Model):
         current_total = now_dt.hour * 60 + now_dt.minute
         target_total = target_hour * 60 + target_minute
 
-        # Fenêtre 5 min (cron tourne toutes les 5 min). Idempotence garantie
-        # par le check state='opened' (session déjà closed = skip à la prochaine).
-        if not (target_total <= current_total < target_total + 5):
+        # Borne basse uniquement : ferme dès que l'heure locale est >= cible.
+        # On a retiré la borne haute (ancien `< target + 5`) car elle limitait
+        # la fermeture au seul tick de 5 min : si le worker cron manquait de
+        # temps en milieu de batch, les sessions non fermées n'étaient JAMAIS
+        # reprises (au tick suivant now >= target+5 → None à jamais).
+        # Idempotence garantie par le check state='opened' (session déjà
+        # fermée = sort du recordset = pas re-traitée / pas de double chatter).
+        # Jamais fermer avant l'heure cible.
+        if current_total < target_total:
             return None
 
         # Edge case 1: opening_control (cashier never validated opening)
@@ -252,6 +332,11 @@ class PosSession(models.Model):
         try/except.
         """
         self.ensure_one()
+        # Reset défensif du compteur d'échecs : si la session avait connu des
+        # échecs transitoires puis se ferme avec succès, on repart de 0. Écrit
+        # dans la même transaction que la fermeture (committée par le cron).
+        if self.auto_close_fail_count:
+            self.auto_close_fail_count = 0
         balance_start = self.cash_register_balance_start
         company_tz = self.company_id.partner_id.tz or 'Indian/Antananarivo'
         try:
