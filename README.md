@@ -227,6 +227,12 @@ parametres par PdV.
 | Multi-PdV meme heure | Traitement sequentiel, transactions isolees |
 | Week-end / dimanche | Cron toujours actif (POS SOPROMER ouvre 7/7) |
 
+> **Note operateur** : depuis 1.4.3 il n'y a plus de borne haute. Toute session
+> ouverte alors que l'heure locale est deja >= l'heure cible sera fermee au
+> prochain tick du cron (ex. session ouverte tot le matin avant une reconfig).
+> C'est voulu (idempotence par `state='opened'`), mais a connaitre pour eviter
+> une fermeture surprise.
+
 ## Tests fonctionnels
 
 ### Test 1 : config globale
@@ -330,6 +336,24 @@ Si la requête retourne 0 ligne, refaire un upgrade complet du module via
 Apps UI ("Mettre à jour"), pas un `-u` ligne de commande.
 
 ## Historique des versions
+
+### 18.0.1.4.4 - 2026-06-09
+
+- **Fix (QA)** : docstring de `_auto_close_dispatch` mise a jour — supprimait
+  encore la mention obsolete "fenetre 5 min" / "target window" alors que la
+  borne haute a ete retiree en 1.4.3. Decrit maintenant exactement la logique :
+  borne basse uniquement, ferme des que `current_time >= target_time`,
+  idempotence par `state='opened'`
+- **Fix (QA)** : `traceback.format_exc()` desormais capture une seule fois dans
+  une variable `tb` en tete du `except` (avant `rollback()`), puis reutilise
+  pour le `_logger.error` ET le chatter. Avant, l'appel tardif a `format_exc()`
+  (apres le try/except interne du compteur d'echecs) pouvait logger/poster la
+  mauvaise trace (celle d'une exception interne rattrapee, pas l'exception
+  originale de la fermeture)
+- Note : pas de changement de comportement metier — corrections de
+  diagnostic/documentation uniquement. Build + test runtime 45 (6/6 PASS) deja
+  valides sur le code 1.4.3 identique cote logique. Revue code QA : verdict
+  GO-avec-corrections, les 2 corrections ci-dessus appliquees
 
 ### 18.0.1.4.3 - 2026-06-09
 

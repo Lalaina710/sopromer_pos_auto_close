@@ -118,6 +118,11 @@ class PosSession(models.Model):
                 # sessions déjà fermées avec succès dans ce run.
                 self.env.cr.commit()
             except Exception as exc:  # noqa: BLE001
+                # Capture la trace de CETTE exception immédiatement, AVANT toute
+                # autre opération. Un try/except interne (compteur ci-dessous)
+                # peut lever puis rattraper une exception ; un appel tardif à
+                # traceback.format_exc() renverrait alors la mauvaise trace.
+                tb = traceback.format_exc()
                 # Defensive: never let one session crash the whole cron.
                 # Rollback AVANT toute autre opération : le curseur peut être en
                 # état "aborted" après l'exception, ce qui ferait échouer toute
@@ -125,7 +130,7 @@ class PosSession(models.Model):
                 self.env.cr.rollback()
                 _logger.error(
                     "[pos_auto_close] Session %s: unexpected error: %s\n%s",
-                    session.name, exc, traceback.format_exc(),
+                    session.name, exc, tb,
                 )
                 # Incrémente le compteur d'échecs dans une transaction FRAÎCHE
                 # (post-rollback) pour qu'il SURVIVE même si une session
@@ -149,7 +154,7 @@ class PosSession(models.Model):
                         session.message_post(
                             body=_(
                                 "Erreur fermeture automatique :<br/><pre>%s</pre>",
-                                traceback.format_exc(),
+                                tb,
                             ),
                             message_type='comment',
                             subtype_xmlid='mail.mt_note',
@@ -208,11 +213,15 @@ class PosSession(models.Model):
 
         Returns:
           dict payload of closed session (suitable for consolidated email)
-          OR None if skipped/not matching window.
+          OR None if skipped.
+
+        Lower bound only: closes as soon as local time >= target time, with
+        no upper bound. Idempotence is guaranteed by the state='opened' check
+        (an already-closed session leaves the recordset and is not reprocessed).
 
         Skips silently when:
           - the PdV opted out (auto_close_enabled = False)
-          - the current time is not within target window (5-min window)
+          - the current time is before the target time (current < target)
           - the session is in opening_control
           - the session has draft orders pending
         """
