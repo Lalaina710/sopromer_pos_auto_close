@@ -27,7 +27,7 @@ physique n'est requis : tous les flux cash sont deja traces dans Odoo
 |--------|--------------------------|
 | `res.config.settings` | `pos_auto_close_enabled`, `pos_auto_close_hour_global`, `pos_auto_close_email_to` (ICP) |
 | `pos.config` | `auto_close_enabled`, `auto_close_hour_override`, `auto_close_email_to_override` |
-| `pos.session` | `_cron_auto_close_sessions()`, `_auto_close_dispatch()`, `_auto_close_session()`, `_send_consolidated_auto_close_email()`, `_resolve_auto_close_email_recipients()` |
+| `pos.session` | `auto_close_fail_count` (Integer, compteur d'echecs consecutifs, circuit-breaker), `_cron_auto_close_sessions()`, `_auto_close_dispatch()`, `_auto_close_session()`, `_send_consolidated_auto_close_email()`, `_resolve_auto_close_email_recipients()` |
 
 Depuis v18.0.1.4.0, `_auto_close_session()` ne déclenche plus l'envoi email
 unitaire : la méthode retourne un dict (payload) décrivant la session fermée
@@ -58,7 +58,7 @@ _cron_auto_close_sessions()
                     |--> skip if config.auto_close_enabled = False
                     |--> target_hour = override OR global
                     |--> compute current_hour in tz societe (defaut Indian/Antananarivo)
-                    |--> skip if current_hour != target_hour
+                    |--> skip if current_time < target_time (borne basse only)
                     |--> skip if state = 'opening_control' (warning)
                     |--> skip if draft orders (activity manager)
                     |--> _auto_close_session()
@@ -188,6 +188,9 @@ Stockes en `ir.config_parameter` :
 
 - `sopromer_pos_auto_close.enabled`
 - `sopromer_pos_auto_close.hour_global`
+- `sopromer_pos_auto_close.max_retries` (Integer, defaut **3**) -- circuit-breaker :
+  nombre maximal d'echecs consecutifs de fermeture auto par session avant que
+  le cron cesse de la retenter (anti-spam chatter)
 
 ### Niveau PdV (Point de Vente -> form pos.config)
 
@@ -214,9 +217,11 @@ parametres par PdV.
 | Session bloquee `opening_control` | Skip + warning log + chatter |
 | Session avec orders `draft` | Skip + activity manager |
 | Toggle PdV `auto_close_enabled = False` | Skip silencieux |
-| Heure courante != heure cible | Skip silencieux |
+| Heure courante avant l'heure cible | Skip silencieux (borne basse only, plus de borne haute : ferme des que `current_time >= target_time`, idempotence garantie par `state='opened'`) |
 | Toggle global desactive | Cron skip immediat |
-| Erreur Python pendant cloture | Log + chatter, autres sessions continuent |
+| Erreur Python pendant cloture | Rollback curseur, incrementation `auto_close_fail_count` en transaction fraiche, log warning ; chatter **uniquement au 1er echec** (anti-flood). Au-dela de `max_retries` (defaut 3) echecs consecutifs, la session n'est plus retentee (reste `opened`, fermeture manuelle requise) ; compteur remis a 0 a la prochaine fermeture reussie |
+| Crash / timeout worker en milieu de batch | `cr.commit()` par session reussie -> les sessions deja fermees sont preservees, jamais annulees par une erreur ulterieure ou un timeout (`limit_time_cpu`/`real`) |
+| Session deja fermee par une iteration anterieure | Re-check d'etat frais (`invalidate_recordset(['state'])`) en debut d'iteration -> skip si `state != 'opened'` |
 | Timezone societe inconnue | Fallback `Indian/Antananarivo` |
 | `hour_global` corrompu en ICP | Fallback 19h |
 | Multi-PdV meme heure | Traitement sequentiel, transactions isolees |
@@ -325,6 +330,41 @@ Si la requête retourne 0 ligne, refaire un upgrade complet du module via
 Apps UI ("Mettre à jour"), pas un `-u` ligne de commande.
 
 ## Historique des versions
+
+### 18.0.1.4.3 - 2026-06-09
+
+- **Feature** : nouveau champ `auto_close_fail_count` (Integer, `default=0`,
+  `copy=False`) sur `pos.session` — compteur d'echecs consecutifs de la
+  fermeture auto
+- **Feature** : circuit-breaker anti-spam — au-dela de `max_retries` echecs
+  consecutifs (ICP `sopromer_pos_auto_close.max_retries`, defaut **3**), la
+  session n'est plus retentee par le cron (reste `opened`, fermeture manuelle
+  requise) au lieu de poster un chatter a chaque tick toute la nuit (ex.
+  picking refuse par `stock_no_negative`). Compteur remis a 0 sur fermeture
+  reussie (reset defensif dans `_auto_close_session()` pour les echecs transitoires)
+- **Fix** : `cr.commit()` par session fermee — chaque fermeture est isolee
+  dans sa propre transaction. Un timeout worker (`limit_time_cpu`/`real`) ou
+  une erreur sur une session suivante ne peut plus annuler les sessions deja
+  fermees avec succes
+- **Fix** : sur exception, `cr.rollback()` AVANT toute autre operation (le
+  curseur peut etre "aborted" post-exception, empoisonnant les sessions
+  suivantes), puis incrementation du compteur dans une transaction fraiche
+  (`invalidate_recordset` -> relit valeur fraiche -> +1 -> commit) pour qu'il
+  survive meme si une session ulterieure rollback
+- **Fix** : chatter poste **uniquement au 1er echec** (`new_count == 1`) —
+  stoppe le flood de messages sur une session bloquee. Les echecs suivants
+  restent dans le log (`_logger.warning`)
+- **Fix** : re-check d'etat frais en debut d'iteration
+  (`invalidate_recordset(['state','auto_close_fail_count'])` puis skip si
+  `state != 'opened'`) — `opened_sessions` est lu une fois en debut de run
+  mais on commit par session, une session peut donc deja avoir ete fermee
+- **Fix** : suppression de la borne haute de la fenetre de fermeture dans
+  `_auto_close_dispatch`. Avant : fenetre `[target_total, target_total+5min[`
+  (fermeture seulement pendant le tick de 5 min) ; si le worker manquait de
+  temps en milieu de batch, les sessions non fermees n'etaient JAMAIS reprises.
+  Maintenant : borne basse uniquement (`if current_total < target_total:
+  return None`) -> ferme des que l'heure locale >= cible. Idempotence toujours
+  garantie par le check `state='opened'`
 
 ### 18.0.1.4.1 - 2026-05-22
 
