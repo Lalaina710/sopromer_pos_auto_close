@@ -281,6 +281,26 @@ parametres par PdV.
 3. Verifier log `_logger.error` + chatter avec stack trace sur la session
    defaillante
 
+### Test 8 : tests automatises (depuis 18.0.1.4.6)
+
+`tests/test_auto_close_cash_moves.py`, `TransactionCase` taggue `post_install` :
+
+```bash
+odoo-bin -d <base> -u sopromer_pos_auto_close \
+         --test-enable --test-tags /sopromer_pos_auto_close --stop-after-init
+```
+
+- `test_only_cash_sale_line_is_tagged_vente_du_jour` : session avec une vente
+  cash (contrepartie `asset_receivable`), un cash in (`asset_current`) et un
+  ecart de cloture (`expense`) — seule la vente porte `[VENTE DU JOUR]`
+- `test_payment_ref_html_is_escaped_but_template_stays_html` : un `payment_ref`
+  contenant `<b>` et `&` est echappe, le gabarit (`<li>`, `&mdash;`) reste HTML
+
+La fixture ne simule pas une vente POS complete : le critere lu par le code est
+le `account_type` de la contrepartie, resolue a la creation de la ligne de
+releve sur `journal.suspense_account_id`. Le test permute ce compte d'attente
+autour de chaque create pour reproduire les trois signatures comptables reelles.
+
 ## Deploiement
 
 Module au standard SOPROMER : depend uniquement de `point_of_sale`,
@@ -336,6 +356,107 @@ Si la requête retourne 0 ligne, refaire un upgrade complet du module via
 Apps UI ("Mettre à jour"), pas un `-u` ligne de commande.
 
 ## Historique des versions
+
+### 18.0.1.4.7 - 2026-09-03
+
+**Test-only — aucune modification de `models/`, le runtime 1.4.6 est inchange.**
+
+- **Test (durcissement)** : `test_only_cash_sale_line_is_tagged_vente_du_jour`
+  n'etait pas contraignant. Le `payment_ref` de la ligne de vente etait
+  `TEST-AC/VENTE` — il contenait litteralement « VENTE » — et la vente portait
+  le plus gros montant. Un `'VENTE' in payment_ref` ou un « plus gros montant »
+  passait les 3 assertions, alors que **ne pas dependre du `payment_ref` est
+  precisement la raison d'etre de la 1.4.5**. Le test validait le comportement
+  observable, pas le mecanisme qu'il documente
+- **Test** : fixture reconstruite en 4 lignes, chacune tuant une famille de
+  leurre — vente `POS/09912` (libelle neutre, != nom de session, montant 1000
+  ni max ni min, creee en 3e position), apport `POS/09913` (**libelle de meme
+  forme que la vente**, montant 1500 > vente), piege `VENTE COMPTOIR - avance`
+  (libelle qui crie « vente », contrepartie compte d'attente → doit rester
+  `CASH IN`), ecart `-25` sur compte de charge. Seul le `account_type` de la
+  contrepartie discrimine
+- **Test** : verifie en rejouant la fixture contre **15 implementations
+  naives** (matching de libelle `'VENTE' in ref` / `startswith('POS/')` /
+  `^POS/\d+$` / `'/' in ref` / `== session.name`, montant max / min positif /
+  seuil, signe, rang de creation, contrepartie `!= asset_current`) : **les 15
+  echouent**, seule la regle reelle passe
+- **Test** : ajout de `assertEqual(len(tags), 4)` — garantit que les 4 lignes
+  sont rendues et qu'aucune assertion ne devient vacante (ni ligne avalee par
+  le nettoyage de l'ecart fantome, ni ratee par le parsing)
+- **Test** : `assertIn('&lt;b&gt;Naka&lt;/b&gt;', body)` ajoute au test
+  d'echappement. `assertNotIn('<b>Naka</b>')` + `assertIn('Naka')` passaient
+  aussi si c'etait `html_sanitize` qui retirait la balise plutot que notre
+  echappement qui la neutralise — la cause est desormais epinglee
+- Note : `set_opening_control(500.0)` inchange, l'ecart de `-25` echappe
+  toujours au nettoyage de l'ecart fantome (`abs(-25 + 500) = 475`), et
+  `balance_end_real` restant aligne sur `cash_register_balance_end`, la
+  difference reste nulle — pas de ligne parasite creee par le closing
+
+### 18.0.1.4.6 - 2026-09-02
+
+- **Fix (sécu, Majeur)** : asymétrie `sudo()` dans `_auto_close_session()`. Le
+  set des lignes de vente etait calcule sur `self.sudo().statement_line_ids`
+  mais la boucle de rendu iterait `self.statement_line_ids` non sudo. Ne levait
+  pas d'`AccessError` uniquement parce que le fetch sudo prechauffe le cache
+  partage de la transaction (dans `Field.__get__`, un hit cache court-circuite
+  le controle d'acces) — donc correct par effet de bord, et casse au moindre
+  reordonnancement du bloc. Le recordset sudo est desormais calcule une fois
+  dans `statement_lines` et sert aux deux usages
+- **Fix (doc)** : commentaire de justification du `sudo()` corrige. Il citait
+  `account.account`, qui n'est pas le mur : `base.group_user` a deja READ
+  dessus. L'ACL n'est pas le mur non plus — `point_of_sale` donne READ a
+  `group_pos_user` sur `account.move` ET `account.move.line`. Le vrai blocage
+  vient des deux record rules POS du core,
+  `point_of_sale.rule_invoice_pos_user` (`[('pos_order_ids','!=',False)]`) et
+  `point_of_sale.rule_invoice_line_pos_user`
+  (`[('move_id.pos_order_ids','!=',False)]`) : l'ecriture d'une ligne de releve
+  de session est l'ecriture de caisse, jamais une facture, donc
+  `pos_order_ids` y est toujours vide (verifie en base : 0 pos_order sur 100 %
+  des `statement_line.move_id` POS)
+- **Fix (sécu, P2)** : `payment_ref` (texte libre saisi par le caissier comme
+  motif de cash in/out) etait interpole en `%s` dans une `str` ensuite wrappee
+  `Markup()` — zero echappement, donc rendu casse dans le chatter ET le mail
+  des qu'un libelle contient `<`, `>` ou `&`. Les lignes sont maintenant
+  construites via `Markup("...") % (...)`, qui echappe les arguments substitues
+  sans toucher au gabarit (`<li>`, `<b>` et `&mdash;` restent du HTML).
+  Applique aussi a `move_ref` par coherence
+- **Refactor (mineur)** : `sale_statement_line_ids` renomme `sale_st_line_ids`
+  — le suffixe `_ids` suggerait un recordset alors que c'est un `set()` d'int
+  (annotation ajoutee)
+- **Test** : ajout de `tests/test_auto_close_cash_moves.py` (`TransactionCase`,
+  `post_install`). Couvre l'heuristique de 1.4.5 — session avec 1 vente cash
+  (contrepartie `asset_receivable`), 1 cash in (`asset_current`) et 1 ecart de
+  cloture (`expense`) : seule la vente porte `[VENTE DU JOUR]`, les deux autres
+  gardent `[CASH IN]` / `[CASH OUT]`. Second test sur l'echappement d'un
+  `payment_ref` hostile. Premier repertoire `tests/` du module
+- Note : pas de changement de comportement metier. Le tag `[VENTE DU JOUR]` et
+  la discrimination de 1.4.5 sont inchanges — seuls le chemin d'acces, le
+  rendu HTML des libelles et la couverture de test bougent
+
+### 18.0.1.4.5 - 2026-09-01
+
+- **Feature** : dans la section "Mouvements de caisse" (chatter + email
+  consolide), la ligne de reglement des ventes especes du jour est desormais
+  taguee `[VENTE DU JOUR]` au lieu de `[CASH IN]`. Les apports et retraits
+  manuels du caissier gardent `[CASH IN]` / `[CASH OUT]`. Rendu :
+  `[VENTE DU JOUR] CSH10/26-27/0242 — POS/05818 : +364 077,78`
+- **Technique** : la discrimination ne repose pas sur le libelle mais sur la
+  contrepartie comptable de la ligne de releve — seule la ligne de vente porte
+  une contrepartie sur un compte client (`asset_receivable`), posee par le core
+  dans `_get_combine_statement_line_vals` / `_get_split_statement_line_vals`.
+  Les cash in/out (`try_cash_in_out`) tombent sur le compte d'attente du
+  journal (`asset_current`), les ecarts de cloture sur les comptes
+  perte/profit (`expense` / `income`)
+- **Technique** : critere valide sur 45 (base `SOPROMER-040826`, 8036 lignes de
+  releve POS) — 4652/4652 lignes de vente captees (4479 consolidees +
+  173 detaillees), 0 faux positif sur 1388 cash in/out et 1995 ecarts de
+  cloture. Le `payment_ref` seul aurait rate les 173 ventes detaillees, dont le
+  libelle vaut le nom du paiement (vide en pratique) et non celui de la session
+- **Technique** : repli conservateur — une ligne non formellement identifiee
+  comme vente reste `[CASH IN]` / `[CASH OUT]`, jamais l'inverse
+- Note : pas de changement de comportement metier — libelle d'audit uniquement.
+  Un seul point modifie (`_auto_close_session()`), donc chatter et email
+  consolide changent ensemble
 
 ### 18.0.1.4.4 - 2026-06-09
 

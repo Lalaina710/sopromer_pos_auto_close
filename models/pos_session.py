@@ -415,17 +415,72 @@ class PosSession(models.Model):
             self.action_pos_session_close()
 
         # 4. Detailed audit message in chatter (per-session = KEPT).
+        # Identification de la ligne de reglement des ventes cash du jour, a
+        # distinguer des apports/retraits manuels du caissier. Critere
+        # structurel : c'est la seule dont l'ecriture porte une contrepartie
+        # sur un compte client (`asset_receivable`), pose par le core dans
+        # _get_combine_statement_line_vals (contrepartie = compte receivable du
+        # mode de paiement) et _get_split_statement_line_vals (contrepartie =
+        # compte client du partenaire). Les cash in/out de `try_cash_in_out`
+        # n'ont pas de contrepartie explicite et tombent sur le compte
+        # d'attente du journal (`asset_current`) ; les ecarts de cloture sur
+        # les comptes perte/profit (`expense` / `income`). Verifie sur 45
+        # (base SOPROMER-040826, 8036 lignes) : 4652/4652 ventes captees,
+        # 0/3383 faux positifs sur les in/out et ecarts. On ne se fie pas au
+        # `payment_ref` seul : il vaut le nom de la session pour les ventes
+        # consolidees mais le nom du paiement (souvent vide) pour les ventes
+        # detaillees, et reste modifiable en comptabilite.
+        # sudo() : le declencheur manuel (action_force_auto_close) peut etre un
+        # responsable PdV n'ayant que `point_of_sale.group_pos_user`. Le mur
+        # n'est pas l'ACL — `point_of_sale/security/ir.model.access.csv` donne
+        # deja READ a ce groupe sur account.move ET account.move.line, et
+        # `base.group_user` a READ sur account.account — mais les deux record
+        # rules POS du core, qui restreignent ce groupe aux ecritures liees a
+        # une commande POS :
+        #   1. `point_of_sale.rule_invoice_pos_user` (account.move)
+        #      -> [('pos_order_ids', '!=', False)]
+        #   2. `point_of_sale.rule_invoice_line_pos_user` (account.move.line)
+        #      -> [('move_id.pos_order_ids', '!=', False)]
+        # Or l'ecriture d'une ligne de releve de session est l'ecriture de
+        # caisse, jamais une facture : `pos_order_ids` y est toujours vide
+        # (verifie en base : 0 pos_order sur 100 % des `statement_line.move_id`
+        # POS). La rule 1 leve donc AccessError des le premier acces a un champ
+        # de `sl.move_id`, la rule 2 redouble le blocage un cran plus loin.
+        # Le recordset sudo est calcule UNE fois et sert aux deux usages ci-
+        # dessous : filtrer en sudo puis iterer en non-sudo ne tiendrait que par
+        # effet de bord du cache de transaction (un hit cache court-circuite le
+        # controle d'acces dans Field.__get__) et casserait au moindre
+        # reordonnancement du bloc.
+        statement_lines = self.sudo().statement_line_ids
+        sale_st_line_ids = set(  # set(int) — ids des lignes identifiees vente
+            statement_lines.filtered(
+                lambda sl: 'asset_receivable' in sl.move_id.line_ids.mapped(
+                    'account_id.account_type'
+                )
+            ).ids
+        )
         cash_moves_lines = []
-        for cm in self.statement_line_ids:
+        for cm in statement_lines:
             amount = round(cm.amount or 0.0, 2)
             sign = '+' if amount >= 0 else '-'
-            kind = _("CASH IN") if amount > 0 else (
-                _("CASH OUT") if amount < 0 else _("CASH")
-            )
+            if cm.id in sale_st_line_ids:
+                kind = _("VENTE DU JOUR")
+            else:
+                # Repli volontairement conservateur : tout ce qui n'est pas
+                # formellement identifie comme vente reste un mouvement de
+                # caisse (mieux vaut un "CASH IN" sur une vente que l'inverse).
+                kind = _("CASH IN") if amount > 0 else (
+                    _("CASH OUT") if amount < 0 else _("CASH")
+                )
             ref = cm.payment_ref or _('(sans libelle)')
             move_ref = (cm.move_id.name if cm.move_id else '') or _('(non poste)')
+            # `payment_ref` est du texte libre saisi par le caissier (motif du
+            # cash in/out) : il peut contenir <, > ou &. On construit la ligne
+            # avec `Markup % args`, qui echappe les arguments substitues sans
+            # toucher au gabarit — les balises et `&mdash;` restent du HTML,
+            # les champs libres sont neutralises. Idem `move_ref` par coherence.
             cash_moves_lines.append(
-                "<li>[%s] <b>%s</b> &mdash; %s : %s%s</li>" % (
+                Markup("<li>[%s] <b>%s</b> &mdash; %s : %s%s</li>") % (
                     kind,
                     move_ref,
                     ref,
@@ -436,10 +491,9 @@ class PosSession(models.Model):
         # Wrap en Markup pour que t-out (Odoo 18) ne ré-échappe pas le HTML
         # dans le template QWeb du mail consolidé. Sans Markup, le rendu
         # affiche les balises brutes (<ul><li>...) au lieu de la liste.
+        # `Markup.join` ne re-echappe pas les elements deja Markup.
         cash_moves_html = (
-            Markup("<ul>%s</ul>") % Markup("").join(
-                Markup(line) for line in cash_moves_lines
-            )
+            Markup("<ul>%s</ul>") % Markup("").join(cash_moves_lines)
             if cash_moves_lines
             else Markup(_("<i>aucun mouvement de caisse</i>"))
         )
