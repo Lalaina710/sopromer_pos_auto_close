@@ -208,3 +208,54 @@ class TestAutoCloseCashMoves(TransactionCase):
             '&mdash;' in body or '—' in body,
             "Le tiret cadratin doit rester du HTML rendu, pas du texte brut.",
         )
+
+    # ------------------------------------------------------------------
+    # Echappement du gabarit lui-meme
+    # ------------------------------------------------------------------
+    def test_audit_template_is_rendered_html_not_escaped(self):
+        """Le gabarit du message d'audit doit sortir en HTML rendu.
+
+        Regression 1.4.8. `_()` echappe le gabarit traduit des qu'un argument
+        substitue est un `Markup` (`odoo/tools/translate.py::get_translation` :
+        `if any(isinstance(a, Markup) ...): translation = escape(translation)`).
+        `moves=cash_moves_html` etant un `Markup` depuis 1.4.1, l'entete du
+        message sortait en `&lt;b&gt;Fermeture automatique...` tandis que la
+        liste des mouvements, elle, restait rendue.
+
+        Le test se lit sur le seul bloc d'entete pour ne pas dependre du
+        `payment_ref` : la fixture n'utilise que des libelles alphanumeriques,
+        donc AUCUN `&lt;` ne doit apparaitre dans le corps. Sur le code
+        d'avant 1.4.8, les trois premieres assertions echouent (verifie en
+        rejouant la chaine d'echappement reelle du core, `get_translation`
+        puis `escape(body)` de `message_post`, sur les deux versions).
+        """
+        self._make_statement_line(self.acc_current, 1500.0, 'POS/09913')
+        self._make_statement_line(self.acc_receivable, 1000.0, 'POS/09912')
+
+        body = self._auto_close_body()
+
+        # 1. L'entete est du HTML, pas du texte affichant des balises.
+        self.assertIn(
+            '<b>Fermeture automatique', body,
+            "L'entete du message d'audit doit etre rendue en gras, pas "
+            "affichee sous forme de balises litterales.",
+        )
+        # 2. Aucune balise du gabarit ne doit ressortir echappee. Avec des
+        #    libelles alphanumeriques, `&lt;` ne peut venir que du gabarit.
+        self.assertNotIn(
+            '&lt;', body,
+            "Une balise du gabarit sort echappee : le corps du message a ete "
+            "echappe (cf. get_translation / escape(body) de message_post).",
+        )
+        # 3. Balise presente UNIQUEMENT dans le gabarit (les <li> viennent du
+        #    Markup des mouvements, deja correct avant le fix : s'appuyer sur
+        #    <b> ou <li> seuls ne discriminerait pas).
+        self.assertIn(
+            '<u>Mouvements de caisse', body,
+            "Le titre de section du gabarit doit etre rendu en HTML.",
+        )
+        # 4. Non-regression 1.4.1/1.4.6 : la liste des mouvements reste du
+        #    HTML et les montants formates traversent l'echappement intacts
+        #    (espace insecable de _fmt_money non transforme en entite).
+        self.assertIn('<li>', body)
+        self.assertIn(self.env['pos.session']._fmt_money(1500.0), body)

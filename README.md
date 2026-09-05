@@ -295,6 +295,9 @@ odoo-bin -d <base> -u sopromer_pos_auto_close \
   ecart de cloture (`expense`) — seule la vente porte `[VENTE DU JOUR]`
 - `test_payment_ref_html_is_escaped_but_template_stays_html` : un `payment_ref`
   contenant `<b>` et `&` est echappe, le gabarit (`<li>`, `&mdash;`) reste HTML
+- `test_audit_template_is_rendered_html_not_escaped` (depuis 18.0.1.4.8) : le
+  gabarit du message d'audit (`<b>`, `<br/>`, `<u>`) est rendu en HTML et non
+  affiche en balises litterales
 
 La fixture ne simule pas une vente POS complete : le critere lu par le code est
 le `account_type` de la contrepartie, resolue a la creation de la ligne de
@@ -356,6 +359,55 @@ Si la requête retourne 0 ligne, refaire un upgrade complet du module via
 Apps UI ("Mettre à jour"), pas un `-u` ligne de commande.
 
 ## Historique des versions
+
+### 18.0.1.4.8 - 2026-09-04
+
+- **Fix (rendu, Majeur)** : le message d'audit poste au chatter de la session
+  s'affichait en balises HTML litterales (`&lt;b&gt;Fermeture automatique a
+  11:36&lt;/b&gt;&lt;br/&gt;...`), seule la liste des mouvements de caisse
+  etant correctement rendue. Cause : `odoo/tools/translate.py::get_translation`
+  echappe le **gabarit traduit** des qu'un des arguments substitues est un
+  `Markup` (`if any(isinstance(a, Markup) for a in args...): translation =
+  escape(translation)`), pour eviter un double echappement. Le gabarit
+  ressortait donc echappe et l'argument `Markup` (`cash_moves_html`) intact —
+  exactement le symptome observe. Corrige avec le patron deja retenu en 1.4.6
+  pour les `<li>` : `Markup(_(gabarit)) % {args}` — le gabarit est traduit
+  seul (sans argument, `get_translation` n'echappe rien), puis `%` echappe les
+  arguments substitues sans y toucher
+- **Fix (rendu, Mineur)** : meme symptome sur le message d'erreur du bloc
+  `except` du cron (`<br/><pre>trace</pre>`), par un mecanisme different : la
+  trace etant une `str`, `_()` n'echappait rien et renvoyait une `str`, que
+  `message_post` echappe integralement (`mail_thread.py` : `'body':
+  escape(body)  # escape if text, keep if markup`). Symetriquement, `%` sur
+  une `str` n'echappait pas la trace — or une trace contient couramment
+  `<string>`, `<class '...'>` ou `<module>`, injectes tels quels dans ce qui
+  se voulait du HTML. Meme patron : gabarit rendu, trace echappee
+- **Anteriorite** : ce bloc `body = _(...)` est inchange depuis `8cebb7e`
+  (18.0.1.0.0, 30/04/2026). Ce n'est donc **pas** une regression des versions
+  1.4.5 a 1.4.7. Avant 1.4.1 le corps entier etait echappe par
+  `message_post` (tout apparaissait brut, `<li>` compris) ; depuis 1.4.1, le
+  passage de `cash_moves_html` en `Markup` a corrige la liste et deplace
+  l'echappement du gabarit vers `get_translation`. **La prod 43, en
+  18.0.1.4.4, est affectee** — dette ancienne, pas incident recent
+- **Note (choix d'ordre)** : `Markup(_(...))` et non `_(Markup(...))`.
+  L'extracteur babel (`_babel_extract_terms(..., extract_keywords={'_': None,
+  '_lt': None})`) ne collecte que les litteraux chaine suivant `_(`. Avec
+  `_(Markup("..."))` le premier argument est un appel, pas un litteral : le
+  terme disparait silencieusement du `.pot`. Verifie en executant
+  `babel.messages.extract` sur les deux formes — seule `Markup(_(...))` est
+  extraite
+- **Test** : `test_audit_template_is_rendered_html_not_escaped`. Fixture a
+  libelles strictement alphanumeriques (`POS/09912`, `POS/09913`) pour que
+  toute occurrence de `&lt;` dans le corps ne puisse venir que du gabarit.
+  Assertions : `<b>Fermeture automatique` present, aucun `&lt;`, `<u>Mouvements
+  de caisse` present (balise presente uniquement dans le gabarit — s'appuyer
+  sur `<b>` ou `<li>` seuls ne discriminerait pas, ils viennent aussi du
+  `Markup` des mouvements deja correct avant le fix). Les 3 echouent sur le
+  code 1.4.7, verifie en rejouant la chaine reelle du core (`get_translation`
+  puis `escape(body)`) sur les deux versions
+- Note : le mail consolide n'est pas concerne — il passe par un gabarit QWeb
+  `t-out`, qui recoit `cash_moves_html` en `Markup` et rend correctement.
+  Non modifie
 
 ### 18.0.1.4.7 - 2026-09-03
 

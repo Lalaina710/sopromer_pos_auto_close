@@ -151,11 +151,23 @@ class PosSession(models.Model):
                 # sur une session bloquée. Les échecs suivants restent dans le log.
                 if new_count == 1:
                     try:
+                        # Meme patron que le message d'audit de
+                        # `_auto_close_session` — ici pour la raison inverse :
+                        # `tb` etant une `str`, `_()` n'echappait rien et
+                        # renvoyait une `str`, que `message_post` echappe
+                        # integralement (`mail_thread.py` : `'body':
+                        # escape(body)  # escape if text, keep if markup`).
+                        # Resultat : `<br/><pre>` affiches en toutes lettres.
+                        # Symetriquement, `%` sur une `str` n'echappait pas
+                        # `tb` : une trace contient couramment `<string>`,
+                        # `<class '...'>` ou `<module>`, injectes tels quels
+                        # dans ce qui se voulait du HTML. `Markup(_(...)) % tb`
+                        # regle les deux : gabarit rendu, trace echappee.
                         session.message_post(
-                            body=_(
-                                "Erreur fermeture automatique :<br/><pre>%s</pre>",
-                                tb,
-                            ),
+                            body=Markup(_(
+                                "Erreur fermeture automatique :"
+                                "<br/><pre>%s</pre>"
+                            )) % tb,
                             message_type='comment',
                             subtype_xmlid='mail.mt_note',
                         )
@@ -498,19 +510,39 @@ class PosSession(models.Model):
             else Markup(_("<i>aucun mouvement de caisse</i>"))
         )
 
-        body = _(
+        # `_()` echappe le gabarit traduit des qu'un des arguments substitues
+        # est un `Markup` — cf. `odoo/tools/translate.py::get_translation` :
+        #   if any(isinstance(a, Markup) for a in args...):
+        #       translation = escape(translation)
+        # Le but du core est d'eviter un double echappement, mais l'effet ici
+        # est que le gabarit sortait en `&lt;b&gt;` dans le chatter des lors
+        # qu'on lui passait `moves=cash_moves_html` (Markup depuis 1.4.1),
+        # tandis que l'argument Markup, lui, restait rendu — d'ou le symptome
+        # observe : entete brute, liste des mouvements correcte.
+        # Meme patron que les `<li>` ci-dessus : le gabarit est traduit SEUL
+        # (aucun argument => `get_translation` court-circuite sur `if not args`
+        # et n'echappe rien), marque `Markup`, puis `%` echappe les arguments
+        # substitues sans toucher au gabarit. `cash_moves_html`, deja `Markup`,
+        # traverse `escape()` inchange.
+        # Ordre `Markup(_(...))` et pas `_(Markup(...))` : l'extracteur babel
+        # (`_babel_extract_terms(..., extract_keywords={'_': None, '_lt': None})`)
+        # ne collecte que les litteraux chaine suivant `_(`. Avec
+        # `_(Markup("..."))` le premier argument est un appel, pas un litteral :
+        # le terme est silencieusement absent du .pot et la traduction meurt.
+        body = Markup(_(
             "<b>Fermeture automatique a %(hour)s</b><br/>"
             "Solde initial : <b>%(start)s</b><br/>"
             "Solde theorique (calcule) : <b>%(expected)s</b><br/>"
             "Solde de cloture reel (auto-rempli) : <b>%(end)s</b><br/>"
             "<br/>"
-            "<u>Mouvements de caisse :</u>%(moves)s",
-            hour=now_str,
-            start=self._fmt_money(balance_start),
-            expected=self._fmt_money(expected_cash),
-            end=self._fmt_money(expected_cash),
-            moves=cash_moves_html,
-        )
+            "<u>Mouvements de caisse :</u>%(moves)s"
+        )) % {
+            'hour': now_str,
+            'start': self._fmt_money(balance_start),
+            'expected': self._fmt_money(expected_cash),
+            'end': self._fmt_money(expected_cash),
+            'moves': cash_moves_html,
+        }
         self.message_post(
             body=body,
             message_type='comment',
